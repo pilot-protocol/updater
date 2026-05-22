@@ -1,5 +1,9 @@
 # updater
 
+[![ci](https://github.com/pilot-protocol/updater/actions/workflows/ci.yml/badge.svg)](https://github.com/pilot-protocol/updater/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/pilot-protocol/updater/branch/main/graph/badge.svg)](https://codecov.io/gh/pilot-protocol/updater)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 Auto-updater plugin for the Pilot Protocol daemon. Polls the GitHub
 releases endpoint hourly, hot-swaps the daemon, pilotctl, and gateway
 binaries when a newer SemVer tag appears, and exits so the supervisor
@@ -40,3 +44,7 @@ supported.
 | Tag | Effect |
 |---|---|
 | `no_updater` | Compiles a stub whose `Start` is a no-op. |
+
+## License
+
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
