@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: updater
+
+      - name: Checkout web4 (sibling protocol repo)
+        uses: actions/checkout@v4
+        with:
+          repository: TeoSlayer/pilotprotocol
+          path: web4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: updater/go.sum
+
+      - name: Run tests with coverage
+        working-directory: updater
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        working-directory: updater
+        run: go tool cover -func=coverage.out | tail -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-updater
+          path: updater/coverage.out
+          retention-days: 30
