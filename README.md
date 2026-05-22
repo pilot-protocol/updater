@@ -1,23 +1,19 @@
 # updater
 
-Pilot Protocol auto-updater plugin. Polls the GitHub releases endpoint
-hourly, hot-swaps the daemon/pilotctl/gateway binaries when a newer
-SemVer tag appears, and exits so the supervisor restarts the new copy.
+Auto-updater plugin for the Pilot Protocol daemon. Polls the GitHub
+releases endpoint hourly, hot-swaps the daemon, pilotctl, and gateway
+binaries when a newer SemVer tag appears, and exits so the supervisor
+restarts the new copy.
 
-## Layout
-
-| File | What it does |
-|---|---|
-| `updater.go` | `Updater` — GitHub release polling, download, SHA verify, atomic rename. |
-| `version.go` | SemVer parsing + comparison. |
-| `service.go` | `*Service` — `coreapi.Service` adapter. Build tag `!no_updater`. |
-| `service_disabled.go` | Stub when build tag `no_updater` is set. |
-
-## Import paths
+## Install
 
 ```go
 import "github.com/pilot-protocol/updater"
+```
 
+## Usage
+
+```go
 u := updater.New(updater.Config{
     Repo:        "TeoSlayer/pilotprotocol",
     CurrentVer:  "v1.10.5",
@@ -26,15 +22,21 @@ u := updater.New(updater.Config{
 u.Run(ctx)
 ```
 
-The sidecar `cmd/updater/main.go` is the standalone entry point;
-the in-process Service adapter is used when embedding into the daemon.
+The in-process `Service` adapter is used when embedding into the
+daemon; a standalone sidecar binary built from this package is also
+supported.
 
-## Disabling
+## Layout
 
-Pass `-tags no_updater` to compile a stub whose `Start` is a no-op.
+| File | What it does |
+|---|---|
+| `updater.go` | `Updater` — GitHub release polling, download, SHA verify, atomic rename. |
+| `version.go` | SemVer parsing and comparison. |
+| `service.go` | `*Service` — `coreapi.Service` adapter. Build tag `!no_updater`. |
+| `service_disabled.go` | Stub when build tag `no_updater` is set. |
 
-## Releasing
+## Build tags
 
-Tag a SemVer version (e.g. `v0.1.0`); web4 pulls it in via
-`require github.com/pilot-protocol/updater v0.1.0`. During
-co-development the protocol repo uses `replace ../updater`.
+| Tag | Effect |
+|---|---|
+| `no_updater` | Compiles a stub whose `Start` is a no-op. |
