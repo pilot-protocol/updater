@@ -237,16 +237,31 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 		return fmt.Errorf("download archive: %w", err)
 	}
 
-	// If checksums available, verify.
-	if checksumsURL != "" {
-		checksumsPath := filepath.Join(tmpDir, "checksums.txt")
-		if err := u.downloadFile(checksumsURL, checksumsPath); err != nil {
-			slog.Warn("failed to download checksums, skipping verification", "error", err)
-		} else if err := VerifyChecksum(archivePath, archiveName, checksumsPath); err != nil {
-			return fmt.Errorf("checksum verification failed: %w", err)
-		}
-		slog.Info("checksum verified", "archive", archiveName)
+	// Verify checksums. Both the asset's presence in the release AND
+	// a successful download are now mandatory — silently skipping
+	// verification was the P0 RCE vector reported in 2026-05-26:
+	// an attacker with GitHub repo write access (compromised PAT,
+	// supply-chain compromise) could publish a release with just the
+	// malicious archive and no checksums.txt, and every Pilot node
+	// would auto-install it unverified. A network MITM dropping just
+	// the checksums.txt fetch had the same effect.
+	//
+	// Note: the checksums.txt file itself is not yet signed — task
+	// #63 tracks adding minisign/Ed25519 signatures on the release
+	// workflow side. Until that lands, a maintainer with GitHub
+	// write access can still publish matched fake binary + fake
+	// checksums. But this change closes the trivial bypass.
+	if checksumsURL == "" {
+		return fmt.Errorf("release %s has no checksums.txt asset; refusing to install unverified binary", release.TagName)
 	}
+	checksumsPath := filepath.Join(tmpDir, "checksums.txt")
+	if err := u.downloadFile(checksumsURL, checksumsPath); err != nil {
+		return fmt.Errorf("download checksums: %w", err)
+	}
+	if err := VerifyChecksum(archivePath, archiveName, checksumsPath); err != nil {
+		return fmt.Errorf("checksum verification failed: %w", err)
+	}
+	slog.Info("checksum verified", "archive", archiveName)
 
 	// Extract to staging directory.
 	stagingDir := filepath.Join(tmpDir, "staging")
