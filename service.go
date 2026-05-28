@@ -8,7 +8,7 @@ package updater
 import (
 	"context"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
+	"github.com/pilot-protocol/common/coreapi"
 )
 
 // Service is the L11 plugin lifecycle adapter for the updater. The
