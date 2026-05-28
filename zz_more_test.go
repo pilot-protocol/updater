@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TeoSlayer/pilotprotocol/pkg/coreapi"
+	"github.com/pilot-protocol/common/coreapi"
 )
 
 // TestService_Plugin exercises the L11 lifecycle no-op adapter.
