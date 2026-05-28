@@ -342,8 +342,19 @@ func (u *Updater) downloadFile(url, dst string) error {
 	}
 	defer f.Close()
 
-	_, err = io.Copy(f, io.LimitReader(resp.Body, maxDownloadBytes))
-	return err
+	// Read one byte past the cap so we can distinguish "exactly at the limit"
+	// from "exceeded the limit". A plain io.LimitReader(maxDownloadBytes) would
+	// silently truncate oversize archives — the SHA256 check would then fail
+	// with a confusing "checksum mismatch" instead of telling the operator
+	// the archive is too large.
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxDownloadBytes+1))
+	if err != nil {
+		return err
+	}
+	if n > maxDownloadBytes {
+		return fmt.Errorf("archive exceeds max download size %d bytes", maxDownloadBytes)
+	}
+	return nil
 }
 
 // VerifyChecksum checks the SHA256 of archivePath against the checksums file.
@@ -440,6 +451,18 @@ func extractTarGz(archivePath, destDir string) error {
 }
 
 func replaceBinary(src, dst string) error {
+	// Refuse to swap in a zero-byte staged binary. A 0-byte rename over the
+	// live daemon binary would brick the daemon on next start; better to fail
+	// loudly here so the operator sees the update failed and the existing
+	// binary keeps running.
+	fi, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if fi.Size() == 0 {
+		return fmt.Errorf("refusing to replace binary with empty source: %s", src)
+	}
+
 	// Write to a temp file beside the destination, then atomically rename.
 	// This avoids "text file busy" on Linux (rename unlinks the old inode
 	// while the running process keeps its file descriptor open) and prevents
