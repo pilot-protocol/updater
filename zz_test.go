@@ -18,6 +18,17 @@ import (
 	"time"
 )
 
+// TestMain disables attestation verification for all tests — test repos
+// don't have real GitHub SLSA attestations, and the test environment may
+// not have the gh CLI installed. A dedicated TestVerifyChecksumsAttestation
+// test exercises the real function in isolation.
+func TestMain(m *testing.M) {
+	verifyChecksumsAttestationFn = func(repo, checksumsPath string) error {
+		return nil
+	}
+	os.Exit(m.Run())
+}
+
 func TestParseSemver(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
