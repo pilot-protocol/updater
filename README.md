@@ -19,11 +19,29 @@ import "github.com/pilot-protocol/updater"
 
 ```go
 u := updater.New(updater.Config{
-    Repo:        "TeoSlayer/pilotprotocol",
-    CurrentVer:  "v1.10.5",
-    BinaryNames: []string{"pilot-daemon", "pilotctl"},
+    Repo:          "TeoSlayer/pilotprotocol",
+    InstallDir:    "/home/user/.pilot/bin",
+    Version:       "v1.10.5",
+    CheckInterval: 1 * time.Hour,
 })
-u.Run(ctx)
+u.Start()
+```
+
+### Pinning a version
+
+Set `PinnedVersion` to lock the updater to a specific release tag. When
+set, the updater fetches the exact release (via
+`/releases/tags/{tag}`), applies it if it differs from the current
+install, then idles — it will **not** chase the latest release. Clear
+`PinnedVersion` (set to `""`) to resume auto-updating.
+
+```go
+u := updater.New(updater.Config{
+    Repo:          "TeoSlayer/pilotprotocol",
+    InstallDir:    "/home/user/.pilot/bin",
+    PinnedVersion: "v1.10.5",  // stay on this version
+})
+u.Start()
 ```
 
 The in-process `Service` adapter is used when embedding into the

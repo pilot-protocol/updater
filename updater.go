@@ -42,6 +42,15 @@ type Config struct {
 	Repo          string // "owner/repo"
 	InstallDir    string
 	Version       string // updater's own version (used for user-agent)
+
+	// PinnedVersion locks the updater to a specific release tag
+	// (e.g. "v1.10.5"). When set, the updater installs exactly that
+	// version — regardless of whether it is newer, older, or already
+	// current — and will not chase the latest release. An empty
+	// string (default) preserves the existing "always follow latest"
+	// behaviour. Set to an empty string to un-pin and resume
+	// auto-updating to the latest stable.
+	PinnedVersion string
 }
 
 // Updater periodically checks GitHub Releases for new versions and optionally applies them.
@@ -125,6 +134,16 @@ func (u *Updater) checkLoop() {
 func (u *Updater) checkOnce() {
 	slog.Debug("checking for updates")
 
+	// Pinned-version path: install a specific version regardless of
+	// whether it is newer or older than the current install. Once the
+	// pinned version is installed, subsequent ticks are no-ops until
+	// the pin is changed or cleared.
+	if u.config.PinnedVersion != "" {
+		u.checkPinnedVersion()
+		return
+	}
+
+	// Default path: follow the latest release.
 	release, err := u.fetchLatestRelease()
 	if err != nil {
 		slog.Error("failed to fetch latest release", "error", err)
@@ -161,8 +180,69 @@ func (u *Updater) checkOnce() {
 	u.touchRestartRecord()
 }
 
+// checkPinnedVersion installs the exact release specified by
+// Config.PinnedVersion if it is not already installed. Unlike the
+// default latest-following path, it does not compare versions — it
+// fetches the named release and applies it unconditionally when the
+// current install differs from the pin.
+func (u *Updater) checkPinnedVersion() {
+	pinned, err := ParseSemver(u.config.PinnedVersion)
+	if err != nil {
+		slog.Error("invalid pinned version", "version", u.config.PinnedVersion, "error", err)
+		return
+	}
+
+	current, err := u.currentVersion()
+	if err != nil {
+		slog.Error("failed to get current version", "error", err)
+		return
+	}
+
+	if current == pinned {
+		slog.Info("pinned version already installed", "version", pinned.String())
+		return
+	}
+
+	slog.Info("pinned version requested, installing",
+		"current", current.String(),
+		"pinned", pinned.String(),
+	)
+
+	release, err := u.fetchReleaseByTag(u.config.PinnedVersion)
+	if err != nil {
+		slog.Error("failed to fetch pinned release", "tag", u.config.PinnedVersion, "error", err)
+		return
+	}
+
+	if err := u.applyUpdate(release); err != nil {
+		slog.Error("failed to apply pinned update", "error", err)
+		return
+	}
+
+	slog.Info("pinned version installed", "version", pinned.String())
+	u.touchRestartRecord()
+}
+
 func (u *Updater) fetchLatestRelease() (*GitHubRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", u.config.Repo)
+	return u.fetchRelease("")
+}
+
+// fetchReleaseByTag fetches a specific release by its Git tag.
+// Example tag: "v1.10.5".
+func (u *Updater) fetchReleaseByTag(tag string) (*GitHubRelease, error) {
+	return u.fetchRelease(tag)
+}
+
+// fetchRelease returns the GitHub release for the given tag. If tag is
+// empty it fetches the latest release.
+func (u *Updater) fetchRelease(tag string) (*GitHubRelease, error) {
+	var url string
+	if tag == "" {
+		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", u.config.Repo)
+	} else {
+		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", u.config.Repo, tag)
+	}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err

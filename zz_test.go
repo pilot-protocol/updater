@@ -13,7 +13,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseSemver(t *testing.T) {
@@ -391,6 +393,193 @@ func TestApplyUpdate_SkipsServerBinaries(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(installDir, name)); err == nil {
 			t.Errorf("%s should not have been created", name)
 		}
+	}
+}
+
+// TestCheckPinnedVersion_AlreadyInstalled verifies that checkPinnedVersion
+// returns immediately (no network round-trip) when the current install
+// already matches the pinned version.
+func TestCheckPinnedVersion_AlreadyInstalled(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+
+	// Current version matches the pin.
+	os.WriteFile(filepath.Join(tmpDir, "pilot-daemon"), []byte("stub"), 0755)
+	os.WriteFile(filepath.Join(tmpDir, ".pilot-version"), []byte("v1.10.5\n"), 0644)
+
+	// A server that should never be hit — any request means a bug.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("unexpected HTTP request when pinned version is already installed")
+	}))
+	defer srv.Close()
+
+	u := &Updater{
+		config: Config{
+			Repo:          "test/repo",
+			InstallDir:    tmpDir,
+			PinnedVersion: "v1.10.5",
+		},
+		client: newRewriteClient(srv),
+		stopCh: make(chan struct{}),
+	}
+
+	// Should be a no-op — no error, no network call.
+	u.checkOnce()
+}
+
+// TestCheckPinnedVersion_InstallsWhenDifferent verifies that when the
+// pinned version differs from the current install, the updater fetches
+// and applies the pinned release.
+func TestCheckPinnedVersion_InstallsWhenDifferent(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+
+	// Current version is v1.9.0, pinned is v1.10.5.
+	os.WriteFile(filepath.Join(tmpDir, "pilot-daemon"), []byte("old-daemon"), 0755)
+	os.WriteFile(filepath.Join(tmpDir, "pilotctl"), []byte("old-pilotctl"), 0755)
+	os.WriteFile(filepath.Join(tmpDir, ".pilot-version"), []byte("v1.9.0\n"), 0644)
+
+	// Build a release archive for the pinned version.
+	archiveDir := t.TempDir()
+	archiveName := fmt.Sprintf("pilot-%s-%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+	archivePath := filepath.Join(archiveDir, archiveName)
+	createTestTarGz(t, archivePath, map[string]string{
+		"daemon":   "pinned-daemon",
+		"pilotctl": "pinned-pilotctl",
+	})
+	archiveContent, _ := os.ReadFile(archivePath)
+	archiveHash := sha256.Sum256(archiveContent)
+	checksumsContent := fmt.Sprintf("%x  %s\n", archiveHash, archiveName)
+
+	// Mock server: serves the pinned release by tag.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/releases/tags/v1.10.5"):
+			json.NewEncoder(w).Encode(GitHubRelease{
+				TagName: "v1.10.5",
+				Assets: []GitHubAsset{
+					{Name: archiveName, BrowserDownloadURL: "http://" + r.Host + "/download/" + archiveName},
+					{Name: "checksums.txt", BrowserDownloadURL: "http://" + r.Host + "/download/checksums.txt"},
+				},
+			})
+		case r.URL.Path == "/download/"+archiveName:
+			w.Write(archiveContent)
+		case r.URL.Path == "/download/checksums.txt":
+			w.Write([]byte(checksumsContent))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	u := &Updater{
+		config: Config{
+			Repo:          "test/repo",
+			InstallDir:    tmpDir,
+			PinnedVersion: "v1.10.5",
+		},
+		client: newRewriteClient(srv),
+		stopCh: make(chan struct{}),
+		exitFn: func(int) {},
+	}
+
+	u.checkOnce()
+
+	// Daemon should be replaced with the pinned version.
+	data, err := os.ReadFile(filepath.Join(tmpDir, "pilot-daemon"))
+	if err != nil {
+		t.Fatalf("read daemon: %v", err)
+	}
+	if string(data) != "pinned-daemon" {
+		t.Errorf("daemon = %q, want 'pinned-daemon'", string(data))
+	}
+
+	// Version file should reflect the pinned release tag.
+	ver, err := os.ReadFile(filepath.Join(tmpDir, ".pilot-version"))
+	if err != nil {
+		t.Fatalf("read version file: %v", err)
+	}
+	if string(ver) != "v1.10.5\n" {
+		t.Errorf(".pilot-version = %q, want 'v1.10.5\\n'", string(ver))
+	}
+}
+
+// TestCheckPinnedVersion_InvalidVersion verifies that an unparseable
+// pinned version is logged and does not panic.
+func TestCheckPinnedVersion_InvalidVersion(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+	os.WriteFile(filepath.Join(tmpDir, "pilot-daemon"), []byte("stub"), 0755)
+	os.WriteFile(filepath.Join(tmpDir, ".pilot-version"), []byte("v1.0.0\n"), 0644)
+
+	u := &Updater{
+		config: Config{
+			Repo:          "test/repo",
+			InstallDir:    tmpDir,
+			PinnedVersion: "not-a-version",
+		},
+		client: &http.Client{Timeout: time.Second},
+		stopCh: make(chan struct{}),
+	}
+
+	// Should not panic — just logs an error and returns.
+	u.checkOnce()
+}
+
+// TestFetchReleaseByTag verifies the by-tag GitHub API endpoint.
+func TestFetchReleaseByTag(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/releases/tags/v1.10.5") {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		ua := r.Header.Get("User-Agent")
+		if !strings.HasPrefix(ua, "pilot-updater/") {
+			t.Errorf("User-Agent = %q, want prefix pilot-updater/", ua)
+		}
+		json.NewEncoder(w).Encode(GitHubRelease{
+			TagName: "v1.10.5",
+			Assets:  []GitHubAsset{},
+		})
+	}))
+	defer srv.Close()
+
+	u := &Updater{
+		config: Config{Repo: "owner/repo", Version: "vTEST"},
+		client: newRewriteClient(srv),
+		stopCh: make(chan struct{}),
+	}
+
+	release, err := u.fetchReleaseByTag("v1.10.5")
+	if err != nil {
+		t.Fatalf("fetchReleaseByTag: %v", err)
+	}
+	if release.TagName != "v1.10.5" {
+		t.Errorf("TagName = %q, want v1.10.5", release.TagName)
+	}
+}
+
+// TestFetchReleaseByTag_NotFound verifies the error path when a
+// pinned tag does not exist.
+func TestFetchReleaseByTag_NotFound(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	u := &Updater{
+		config: Config{Repo: "owner/repo"},
+		client: newRewriteClient(srv),
+		stopCh: make(chan struct{}),
+	}
+
+	_, err := u.fetchReleaseByTag("v99.99.99")
+	if err == nil {
+		t.Fatal("expected error for non-existent tag")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("error does not mention 404: %v", err)
 	}
 }
 
