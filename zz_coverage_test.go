@@ -786,3 +786,35 @@ func TestArchiveToInstallMapping(t *testing.T) {
 		}
 	}
 }
+
+// TestVerifyChecksumsAttestation_GhNotInstalled verifies graceful
+// skip when gh CLI is not on PATH.
+func TestVerifyChecksumsAttestation_GhNotInstalled(t *testing.T) {
+	t.Parallel()
+
+	// Temporarily unset PATH so LookPath fails.
+	origPath := os.Getenv("PATH")
+	os.Setenv("PATH", "")
+	defer os.Setenv("PATH", origPath)
+
+	err := verifyChecksumsAttestationFn("test/repo", "/nonexistent/checksums.txt")
+	if err != nil {
+		t.Errorf("expected graceful skip when gh not installed, got error: %v", err)
+	}
+}
+
+// TestVerifyChecksumsAttestation_SkipConfig verifies the config-driven skip.
+func TestVerifyChecksumsAttestation_SkipConfig(t *testing.T) {
+	t.Parallel()
+
+	u := New(Config{
+		InstallDir:      t.TempDir(),
+		Repo:            "test/repo",
+		SkipAttestation: true,
+	})
+
+	err := u.verifyChecksumsAttestation("/nonexistent/checksums.txt")
+	if err != nil {
+		t.Errorf("SkipAttestation=true should return nil, got: %v", err)
+	}
+}

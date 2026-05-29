@@ -51,6 +51,12 @@ type Config struct {
 	// behaviour. Set to an empty string to un-pin and resume
 	// auto-updating to the latest stable.
 	PinnedVersion string
+
+	// SkipAttestation disables SLSA attestation verification of
+	// checksums.txt. Intended for test environments where the test
+	// repos do not have real attestations. Default (false) enables
+	// verification in production.
+	SkipAttestation bool
 }
 
 // Updater periodically checks GitHub Releases for new versions and optionally applies them.
@@ -326,11 +332,11 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 	// would auto-install it unverified. A network MITM dropping just
 	// the checksums.txt fetch had the same effect.
 	//
-	// Note: the checksums.txt file itself is not yet signed — task
-	// #63 tracks adding minisign/Ed25519 signatures on the release
-	// workflow side. Until that lands, a maintainer with GitHub
-	// write access can still publish matched fake binary + fake
-	// checksums. But this change closes the trivial bypass.
+	// The checksums.txt file itself is now attested via SLSA
+	// (actions/attest-build-provenance@v2 in release.yml, PILOT-120
+	// PR #166). verifyChecksumsAttestation (below) checks provenance
+	// before trusting the checksums file, closing the "matched fake
+	// binary + fake checksums" gap.
 	if checksumsURL == "" {
 		return fmt.Errorf("release %s has no checksums.txt asset; refusing to install unverified binary", release.TagName)
 	}
@@ -338,6 +344,18 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 	if err := u.downloadFile(checksumsURL, checksumsPath); err != nil {
 		return fmt.Errorf("download checksums: %w", err)
 	}
+
+	// Verify checksums.txt provenance via GitHub SLSA attestation.
+	// The release workflow attests checksums.txt via
+	// actions/attest-build-provenance@v2 (PILOT-120, PR #166).
+	// This closes the "attacker publishes matched fake binary +
+	// fake checksums.txt" gap — the attestation ties checksums.txt
+	// to the trusted CI workflow. Graceful skip when gh CLI is
+	// unavailable (operator directive: not every environment has it).
+	if err := u.verifyChecksumsAttestation(checksumsPath); err != nil {
+		return fmt.Errorf("checksums attestation verification failed: %w", err)
+	}
+
 	if err := VerifyChecksum(archivePath, archiveName, checksumsPath); err != nil {
 		return fmt.Errorf("checksum verification failed: %w", err)
 	}
@@ -676,4 +694,43 @@ func (u *Updater) signalDaemonRestartLinux() {
 		}
 	}
 	slog.Warn("daemon process not found — restart daemon manually")
+}
+
+// verifyChecksumsAttestation verifies the SLSA provenance of checksums.txt
+// via the GitHub CLI's attestation verify command. The release workflow
+// (release.yml) attests checksums.txt via actions/attest-build-provenance@v2
+// (PILOT-120, PR #166). This closes the "attacker publishes matched fake
+// binary + fake checksums.txt" gap — the attestation ties checksums.txt to
+// the trusted CI workflow identity.
+//
+// If gh is not on PATH, we log a warning and return nil (graceful skip per
+// operator directive: not every environment has gh installed). If gh is
+// present but verification fails, we return an error — the checksums file
+// cannot be trusted.
+func (u *Updater) verifyChecksumsAttestation(checksumsPath string) error {
+	if u.config.SkipAttestation {
+		slog.Debug("skipping attestation verification (SkipAttestation=true)")
+		return nil
+	}
+	return verifyChecksumsAttestationFn(u.config.Repo, checksumsPath)
+}
+
+// verifyChecksumsAttestationFn is the default attestation verification
+// implementation. Tests may replace it to avoid requiring a real GitHub
+// repo with SLSA attestations.
+var verifyChecksumsAttestationFn = func(repo, checksumsPath string) error {
+	ghPath, err := exec.LookPath("gh")
+	if err != nil {
+		slog.Warn("gh CLI not found — skipping attestation verification; install gh for full provenance guarantee",
+			"install_url", "https://cli.github.com/")
+		return nil
+	}
+
+	cmd := exec.Command(ghPath, "attestation", "verify", checksumsPath, "--repo", repo)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh attestation verify: %s: %w", strings.TrimSpace(string(output)), err)
+	}
+	slog.Info("checksums provenance verified via SLSA attestation")
+	return nil
 }
