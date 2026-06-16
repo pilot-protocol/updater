@@ -102,6 +102,16 @@ func (u *Updater) Stop() {
 	u.wg.Wait()
 }
 
+// RunOnce runs the update check once synchronously and returns. Unlike
+// Start, it does not enter a periodic loop — it performs a single check
+// (checking the pinned version or latest release), applies the update if
+// available, and returns. Useful for one-shot invocations from
+// `pilotctl update` and similar CLI commands.
+func (u *Updater) RunOnce() {
+	u.recoverPendingRestart()
+	u.checkOnce()
+}
+
 func (u *Updater) checkLoop() {
 	defer u.wg.Done()
 
