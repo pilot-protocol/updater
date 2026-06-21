@@ -57,6 +57,16 @@ type Config struct {
 	// repos do not have real attestations. Default (false) enables
 	// verification in production.
 	SkipAttestation bool
+
+	// StatePath, when non-empty, points to a JSON control file
+	// {"enabled": bool} that gates the AUTOMATIC update loop and is
+	// re-read on every tick. When the file is absent or {"enabled":
+	// false} the loop performs NO updates — so any deployment that sets
+	// StatePath is OFF BY DEFAULT until explicitly enabled (e.g. via
+	// `pilotctl update enable`). A manual one-shot RunOnce always runs,
+	// ignoring this gate. An empty StatePath preserves the legacy
+	// always-on loop behaviour for backward compatibility.
+	StatePath string
 }
 
 // Updater periodically checks GitHub Releases for new versions and optionally applies them.
@@ -106,10 +116,33 @@ func (u *Updater) Stop() {
 // Start, it does not enter a periodic loop — it performs a single check
 // (checking the pinned version or latest release), applies the update if
 // available, and returns. Useful for one-shot invocations from
-// `pilotctl update` and similar CLI commands.
+// `pilotctl update` and similar CLI commands. It ALWAYS runs — the
+// StatePath enabled-gate applies only to the automatic loop, so a manual
+// `pilotctl update` works even when auto-update is disabled.
 func (u *Updater) RunOnce() {
 	u.recoverPendingRestart()
 	u.checkOnce()
+}
+
+// enabled reports whether the automatic update loop may apply updates. With
+// no StatePath configured it returns true (legacy always-on). Otherwise it
+// reads the JSON control file and defaults to false (off) when the file is
+// missing, unreadable, or malformed — auto-update is strictly opt-in.
+func (u *Updater) enabled() bool {
+	if u.config.StatePath == "" {
+		return true
+	}
+	data, err := os.ReadFile(u.config.StatePath)
+	if err != nil {
+		return false
+	}
+	var s struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.Unmarshal(data, &s); err != nil {
+		return false
+	}
+	return s.Enabled
 }
 
 func (u *Updater) checkLoop() {
@@ -119,8 +152,12 @@ func (u *Updater) checkLoop() {
 	// (e.g. old macOS updater replaced the binary but never called launchctl).
 	u.recoverPendingRestart()
 
-	// Run once immediately on start.
-	u.checkOnce()
+	// Run once immediately on start (only if auto-update is enabled).
+	if u.enabled() {
+		u.checkOnce()
+	} else {
+		slog.Info("auto-update disabled; loop idle until enabled", "state_path", u.config.StatePath)
+	}
 
 	ticker := time.NewTicker(u.config.CheckInterval)
 	defer ticker.Stop()
@@ -140,7 +177,13 @@ func (u *Updater) checkLoop() {
 				jitterTimer.Stop()
 				return
 			}
-			u.checkOnce()
+			// Re-read the gate each tick so `pilotctl update enable/disable`
+			// takes effect without restarting the updater.
+			if u.enabled() {
+				u.checkOnce()
+			} else {
+				slog.Debug("auto-update disabled; skipping tick")
+			}
 		case <-u.stopCh:
 			return
 		}
