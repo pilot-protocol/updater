@@ -202,12 +202,12 @@ func TestSemver_String(t *testing.T) {
 func TestParseSemver_Errors(t *testing.T) {
 	t.Parallel()
 	bad := []string{
-		"1.2",      // not three parts
-		"x.y.z",    // non-numeric major
-		"1.y.3",    // non-numeric minor
-		"1.2.q",    // non-numeric patch
-		"",         // empty
-		"1.2.3.4",  // too many parts
+		"1.2",     // not three parts
+		"x.y.z",   // non-numeric major
+		"1.y.3",   // non-numeric minor
+		"1.2.q",   // non-numeric patch
+		"",        // empty
+		"1.2.3.4", // too many parts
 	}
 	for _, in := range bad {
 		if _, err := ParseSemver(in); err == nil {

@@ -592,13 +592,23 @@ func extractTarGz(archivePath, destDir string) error {
 		}
 
 		dst := filepath.Join(destDir, name)
-		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755) //nolint:gosec // G302: extracted files are executables and must be 0755
 		if err != nil {
 			return fmt.Errorf("create %s: %w", name, err)
 		}
-		if _, err := io.Copy(out, tr); err != nil {
+		// Cap per-entry extraction to bound a decompression bomb: a
+		// crafted archive could expand far beyond maxDownloadBytes even
+		// after the on-disk size was capped at download time. Copy one
+		// byte past the cap so we can tell "exactly at limit" from
+		// "exceeded".
+		n, err := io.Copy(out, io.LimitReader(tr, maxDownloadBytes+1))
+		if err != nil {
 			out.Close()
 			return fmt.Errorf("write %s: %w", name, err)
+		}
+		if n > maxDownloadBytes {
+			out.Close()
+			return fmt.Errorf("archive entry %q exceeds max extract size %d bytes", name, maxDownloadBytes)
 		}
 		out.Close()
 	}

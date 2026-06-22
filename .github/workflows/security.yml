@@ -1,0 +1,82 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Race-detector gate. ci.yml runs the suite with coverage; this is the
+  # explicit, security-scoped -race gate so a data race fails the security
+  # workflow independently of the coverage upload.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race ./...
+
+  # SAST. Accepted rule exclusions (documented, minimal — never blanket):
+  #   G104 — best-effort os.Remove/Close on error-cleanup paths.
+  #   G204 — exec of gh / launchctl with internally-built args (no user input).
+  #   G301 — staging/install dirs are 0755 (operator-readable install tree).
+  #   G302 — extracted artifacts are executables and must be 0755.
+  #   G304 — file paths derive from InstallDir / temp dir, inherent to an updater.
+  #   G404 — math/rand used only for thundering-herd jitter, not for secrets.
+  # G110 (decompression bomb) is FIXED in code (per-entry LimitReader), not excluded.
+  gosec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: securego/gosec@v2.27.1
+        with:
+          args: -exclude=G104,G204,G301,G302,G304,G404 -exclude-dir=.git ./...
+
+  # Known-vulnerability scan of the call graph (stdlib + deps).
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: go.sum
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1.0.4
+        with:
+          go-version-input: '1.25'
+          go-package: ./...
+
+  # Secret scan over the full history on push, the PR range on PR.
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Block PRs that introduce dependencies with known vulnerabilities or
+  # incompatible licenses. PR-only (needs the base..head diff).
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v3
+        with:
+          fail-on-severity: high
