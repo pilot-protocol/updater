@@ -196,3 +196,96 @@ func TestApplyUpdate_PassesWithValidChecksums(t *testing.T) {
 		t.Fatalf("green-path install failed: %v", err)
 	}
 }
+
+// TestApplyUpdate_SkipAttestationStillRequiresChecksum verifies that
+// SkipAttestation=true bypasses ONLY the SLSA attestation check — the
+// mandatory SHA256 checksums.txt match is still enforced. A matching
+// archive installs; a tampered archive is refused. The real attestation
+// function is restored so the test proves SkipAttestation is the live
+// bypass, not the TestMain stub.
+func TestApplyUpdate_SkipAttestationStillRequiresChecksum(t *testing.T) {
+	// Not parallel: restores the package-level verifyChecksumsAttestationFn.
+	origFn := verifyChecksumsAttestationFn
+	verifyChecksumsAttestationFn = realVerifyChecksumsAttestationFn
+	defer func() { verifyChecksumsAttestationFn = origFn }()
+
+	archiveName := fmt.Sprintf("pilot-%s-%s.tar.gz", runtime.GOOS, runtime.GOARCH)
+
+	newServer := func(t *testing.T, archiveContent []byte, checksumsContent string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/download/" + archiveName:
+				w.Write(archiveContent)
+			case "/download/checksums.txt":
+				w.Write([]byte(checksumsContent))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+
+	newRelease := func(srvURL string) *GitHubRelease {
+		return &GitHubRelease{
+			TagName: "v1.1.0",
+			Assets: []GitHubAsset{
+				{Name: archiveName, BrowserDownloadURL: srvURL + "/download/" + archiveName},
+				{Name: "checksums.txt", BrowserDownloadURL: srvURL + "/download/checksums.txt"},
+			},
+		}
+	}
+
+	t.Run("matching checksum installs", func(t *testing.T) {
+		installDir := filepath.Join(t.TempDir(), "bin")
+		os.MkdirAll(installDir, 0755)
+		os.WriteFile(filepath.Join(installDir, ".pilot-version"), []byte("v1.0.0\n"), 0644)
+
+		archivePath := filepath.Join(t.TempDir(), archiveName)
+		createTestTarGz(t, archivePath, map[string]string{"daemon": "good-content"})
+		archiveContent, _ := os.ReadFile(archivePath)
+		hash := sha256.Sum256(archiveContent)
+		checksumsContent := fmt.Sprintf("%x  %s\n", hash, archiveName)
+
+		srv := newServer(t, archiveContent, checksumsContent)
+		defer srv.Close()
+
+		u := &Updater{
+			config: Config{InstallDir: installDir, SkipAttestation: true},
+			client: srv.Client(),
+			stopCh: make(chan struct{}),
+			exitFn: func(int) {},
+		}
+		if err := u.applyUpdate(newRelease(srv.URL)); err != nil {
+			t.Fatalf("SkipAttestation=true with matching checksum should install: %v", err)
+		}
+	})
+
+	t.Run("checksum mismatch is refused", func(t *testing.T) {
+		installDir := filepath.Join(t.TempDir(), "bin")
+		os.MkdirAll(installDir, 0755)
+		os.WriteFile(filepath.Join(installDir, ".pilot-version"), []byte("v1.0.0\n"), 0644)
+
+		archivePath := filepath.Join(t.TempDir(), archiveName)
+		createTestTarGz(t, archivePath, map[string]string{"daemon": "good-content"})
+		archiveContent, _ := os.ReadFile(archivePath)
+		// Checksum for DIFFERENT content — simulates a tampered archive.
+		wrongHash := sha256.Sum256([]byte("attacker-controlled"))
+		checksumsContent := fmt.Sprintf("%x  %s\n", wrongHash, archiveName)
+
+		srv := newServer(t, archiveContent, checksumsContent)
+		defer srv.Close()
+
+		u := &Updater{
+			config: Config{InstallDir: installDir, SkipAttestation: true},
+			client: srv.Client(),
+			stopCh: make(chan struct{}),
+			exitFn: func(int) {},
+		}
+		err := u.applyUpdate(newRelease(srv.URL))
+		if err == nil {
+			t.Fatal("SkipAttestation=true must still enforce SHA256: mismatch should fail")
+		}
+		if !strings.Contains(err.Error(), "checksum") {
+			t.Errorf("expected checksum verification error, got: %v", err)
+		}
+	})
+}

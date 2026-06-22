@@ -787,23 +787,56 @@ func TestArchiveToInstallMapping(t *testing.T) {
 	}
 }
 
-// TestVerifyChecksumsAttestation_GhNotInstalled verifies graceful
-// skip when gh CLI is not on PATH.
+// TestVerifyChecksumsAttestation_GhNotInstalled verifies the gate FAILS
+// CLOSED when the gh CLI is not on PATH. The previous behaviour (silent
+// pass) turned the SLSA provenance gate into a no-op on every headless
+// production host, since install.sh never installs gh.
 func TestVerifyChecksumsAttestation_GhNotInstalled(t *testing.T) {
-	t.Parallel()
+	// Not parallel: mutates the process-wide PATH.
 
 	// Temporarily unset PATH so LookPath fails.
 	origPath := os.Getenv("PATH")
 	os.Setenv("PATH", "")
 	defer os.Setenv("PATH", origPath)
 
-	err := verifyChecksumsAttestationFn("test/repo", "/nonexistent/checksums.txt")
-	if err != nil {
-		t.Errorf("expected graceful skip when gh not installed, got error: %v", err)
+	// Call the real implementation directly — TestMain stubs the package
+	// variable to a nil-returning func for the rest of the suite.
+	err := realVerifyChecksumsAttestationFn("test/repo", "/nonexistent/checksums.txt")
+	if err == nil {
+		t.Fatal("expected error when gh is absent (fail closed), got nil")
+	}
+	if !strings.Contains(err.Error(), "gh CLI required") {
+		t.Errorf("error should explain gh is required, got: %v", err)
 	}
 }
 
-// TestVerifyChecksumsAttestation_SkipConfig verifies the config-driven skip.
+// TestVerifyChecksumsAttestation_FailsClosedWithoutSkip verifies that the
+// wrapper refuses the update when gh is absent and SkipAttestation is false.
+func TestVerifyChecksumsAttestation_FailsClosedWithoutSkip(t *testing.T) {
+	// Not parallel: mutates the process-wide PATH and the package-level
+	// verifyChecksumsAttestationFn.
+	origFn := verifyChecksumsAttestationFn
+	verifyChecksumsAttestationFn = realVerifyChecksumsAttestationFn
+	defer func() { verifyChecksumsAttestationFn = origFn }()
+
+	origPath := os.Getenv("PATH")
+	os.Setenv("PATH", "")
+	defer os.Setenv("PATH", origPath)
+
+	u := New(Config{
+		InstallDir:      t.TempDir(),
+		Repo:            "test/repo",
+		SkipAttestation: false,
+	})
+
+	err := u.verifyChecksumsAttestation("/nonexistent/checksums.txt")
+	if err == nil {
+		t.Fatal("expected fail-closed error when gh absent and SkipAttestation=false, got nil")
+	}
+}
+
+// TestVerifyChecksumsAttestation_SkipConfig verifies the config-driven skip
+// is the only way to bypass attestation.
 func TestVerifyChecksumsAttestation_SkipConfig(t *testing.T) {
 	t.Parallel()
 

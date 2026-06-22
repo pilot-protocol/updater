@@ -53,9 +53,13 @@ type Config struct {
 	PinnedVersion string
 
 	// SkipAttestation disables SLSA attestation verification of
-	// checksums.txt. Intended for test environments where the test
-	// repos do not have real attestations. Default (false) enables
-	// verification in production.
+	// checksums.txt. This is the ONLY way to bypass attestation: when
+	// false (the default) and the gh CLI is absent, verification fails
+	// closed and the update is refused. Intended for test environments
+	// where the test repos do not have real attestations. Leaving it
+	// false in production keeps provenance verification mandatory.
+	// The SHA256 checksums.txt match is always enforced regardless of
+	// this flag.
 	SkipAttestation bool
 
 	// StatePath, when non-empty, points to a JSON control file
@@ -403,8 +407,8 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 	// actions/attest-build-provenance@v2 (PILOT-120, PR #166).
 	// This closes the "attacker publishes matched fake binary +
 	// fake checksums.txt" gap — the attestation ties checksums.txt
-	// to the trusted CI workflow. Graceful skip when gh CLI is
-	// unavailable (operator directive: not every environment has it).
+	// to the trusted CI workflow. Fails closed when the gh CLI is
+	// unavailable unless SkipAttestation is explicitly set.
 	if err := u.verifyChecksumsAttestation(checksumsPath); err != nil {
 		return fmt.Errorf("checksums attestation verification failed: %w", err)
 	}
@@ -756,27 +760,35 @@ func (u *Updater) signalDaemonRestartLinux() {
 // binary + fake checksums.txt" gap — the attestation ties checksums.txt to
 // the trusted CI workflow identity.
 //
-// If gh is not on PATH, we log a warning and return nil (graceful skip per
-// operator directive: not every environment has gh installed). If gh is
-// present but verification fails, we return an error — the checksums file
-// cannot be trusted.
+// This gate FAILS CLOSED: if the gh CLI is not on PATH, verification returns
+// an error and the update does not proceed. The only way to skip attestation
+// is to set Config.SkipAttestation explicitly — there is no implicit skip.
+// This is deliberate: the prior "gh absent => pass" behaviour silently
+// disabled the entire provenance gate on headless production hosts (install.sh
+// never installs gh), collapsing auto-update integrity back to "anyone with
+// GitHub repo-write access can ship a malicious release."
 func (u *Updater) verifyChecksumsAttestation(checksumsPath string) error {
 	if u.config.SkipAttestation {
-		slog.Debug("skipping attestation verification (SkipAttestation=true)")
+		slog.Warn("SLSA attestation verification disabled (SkipAttestation=true) — checksums provenance is NOT verified")
 		return nil
 	}
 	return verifyChecksumsAttestationFn(u.config.Repo, checksumsPath)
 }
 
-// verifyChecksumsAttestationFn is the default attestation verification
-// implementation. Tests may replace it to avoid requiring a real GitHub
-// repo with SLSA attestations.
-var verifyChecksumsAttestationFn = func(repo, checksumsPath string) error {
+// verifyChecksumsAttestationFn is the attestation verification implementation
+// used by the updater. Tests may replace it to avoid requiring a real GitHub
+// repo with SLSA attestations; they restore realVerifyChecksumsAttestationFn
+// to exercise the production path.
+var verifyChecksumsAttestationFn = realVerifyChecksumsAttestationFn
+
+// realVerifyChecksumsAttestationFn is the production attestation check. It
+// fails closed when gh is absent: callers only reach this function when
+// SkipAttestation is false, so a missing gh means provenance cannot be
+// established and the update must be refused.
+func realVerifyChecksumsAttestationFn(repo, checksumsPath string) error {
 	ghPath, err := exec.LookPath("gh")
 	if err != nil {
-		slog.Warn("gh CLI not found — skipping attestation verification; install gh for full provenance guarantee",
-			"install_url", "https://cli.github.com/")
-		return nil
+		return fmt.Errorf("gh CLI required for SLSA attestation verification; install gh (https://cli.github.com/) or set SkipAttestation to bypass: %w", err)
 	}
 
 	cmd := exec.Command(ghPath, "attestation", "verify", checksumsPath, "--repo", repo)

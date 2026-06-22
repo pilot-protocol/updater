@@ -18,10 +18,12 @@ import (
 	"time"
 )
 
-// TestMain disables attestation verification for all tests — test repos
-// don't have real GitHub SLSA attestations, and the test environment may
-// not have the gh CLI installed. A dedicated TestVerifyChecksumsAttestation
-// test exercises the real function in isolation.
+// TestMain stubs attestation verification for the bulk of the suite —
+// test repos don't have real GitHub SLSA attestations, and the test
+// environment may not have the gh CLI installed. Tests that need the
+// production fail-closed behaviour restore realVerifyChecksumsAttestationFn
+// explicitly (see TestVerifyChecksumsAttestation_* and
+// TestApplyUpdate_SkipAttestationStillRequiresChecksum).
 func TestMain(m *testing.M) {
 	verifyChecksumsAttestationFn = func(repo, checksumsPath string) error {
 		return nil
