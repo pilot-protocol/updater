@@ -1,0 +1,98 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Race-detector gate. ci.yml runs the suite with coverage; this is the
+  # explicit, security-scoped -race gate so a data race fails the security
+  # workflow independently of the coverage upload.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race ./...
+
+  # SAST. Accepted rule exclusions (documented, minimal — never blanket):
+  #   G104 — best-effort os.Remove/Close on error-cleanup paths.
+  #   G204 — exec of gh / launchctl with internally-built args (no user input).
+  #   G301 — staging/install dirs are 0755 (operator-readable install tree).
+  #   G302 — extracted artifacts are executables and must be 0755.
+  #   G304 — file paths derive from InstallDir / temp dir, inherent to an updater.
+  #   G404 — math/rand used only for thundering-herd jitter, not for secrets.
+  # G110 (decompression bomb) is FIXED in code (per-entry LimitReader), not excluded.
+  gosec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: securego/gosec@v2.27.1
+        with:
+          args: -exclude=G104,G204,G301,G302,G304,G404 -exclude-dir=.git ./...
+
+  # Known-vulnerability scan of the call graph (stdlib + deps).
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+          cache-dependency-path: go.sum
+      - name: govulncheck
+        # golang/govulncheck-action does its own git fetch and fails with
+        # "fatal: unable to access ... error: 400" on org repos. Run the tool
+        # directly after checkout + setup-go (rendezvous/common pattern).
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # Secret scan over the full history on push, the PR range on PR.
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The gitleaks GitHub Action requires a paid GITLEAKS_LICENSE secret for
+      # organization repos and fails with "missing gitleaks license". The
+      # gitleaks binary is MIT-licensed and free, so run a version-pinned
+      # binary release directly — same scan, no license gate.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run gitleaks (full history)
+        run: |
+          gitleaks git --no-banner --redact --verbose .
+
+  # Block PRs that introduce dependencies with known vulnerabilities or
+  # incompatible licenses. PR-only (needs the base..head diff).
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v3
+        with:
+          fail-on-severity: high

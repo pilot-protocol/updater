@@ -585,20 +585,39 @@ func extractTarGz(archivePath, destDir string) error {
 			continue
 		}
 
-		// Sanitize path — prevent directory traversal.
+		// Sanitize path — prevent directory traversal. filepath.Base strips
+		// any leading path / ".." elements from the archive entry name.
 		name := filepath.Base(hdr.Name)
 		if name == "." || name == ".." {
 			continue
 		}
 
 		dst := filepath.Join(destDir, name)
-		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		// Defence in depth: reject any entry whose cleaned destination would
+		// escape destDir (Zip Slip / CWE-022). filepath.Base already prevents
+		// this, but the explicit containment check makes the invariant
+		// auditable and is the sanitizer CodeQL's go/zipslip dataflow expects.
+		cleanDest := filepath.Clean(destDir) + string(os.PathSeparator)
+		if !strings.HasPrefix(filepath.Clean(dst)+string(os.PathSeparator), cleanDest) {
+			return fmt.Errorf("archive entry %q escapes destination dir", hdr.Name)
+		}
+		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755) //nolint:gosec // G302: extracted files are executables and must be 0755
 		if err != nil {
 			return fmt.Errorf("create %s: %w", name, err)
 		}
-		if _, err := io.Copy(out, tr); err != nil {
+		// Cap per-entry extraction to bound a decompression bomb: a
+		// crafted archive could expand far beyond maxDownloadBytes even
+		// after the on-disk size was capped at download time. Copy one
+		// byte past the cap so we can tell "exactly at limit" from
+		// "exceeded".
+		n, err := io.Copy(out, io.LimitReader(tr, maxDownloadBytes+1))
+		if err != nil {
 			out.Close()
 			return fmt.Errorf("write %s: %w", name, err)
+		}
+		if n > maxDownloadBytes {
+			out.Close()
+			return fmt.Errorf("archive entry %q exceeds max extract size %d bytes", name, maxDownloadBytes)
 		}
 		out.Close()
 	}
