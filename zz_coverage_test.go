@@ -787,41 +787,44 @@ func TestArchiveToInstallMapping(t *testing.T) {
 	}
 }
 
-// TestVerifyChecksumsAttestation_GhNotInstalled verifies the gate FAILS
-// CLOSED when the gh CLI is not on PATH. The previous behaviour (silent
-// pass) turned the SLSA provenance gate into a no-op on every headless
-// production host, since install.sh never installs gh.
-func TestVerifyChecksumsAttestation_GhNotInstalled(t *testing.T) {
-	// Not parallel: mutates the process-wide PATH.
+// TestVerifyChecksumsAttestation_MissingTagFailsClosed verifies the real gh-free
+// implementation refuses to verify without a release tag — the tag is what binds
+// checksums.txt to THIS release and prevents replaying an older attested
+// checksums.txt under a new tag (validated rollback). This check happens before
+// any network access, so the test is deterministic and offline.
+func TestVerifyChecksumsAttestation_MissingTagFailsClosed(t *testing.T) {
+	t.Parallel()
 
-	// Temporarily unset PATH so LookPath fails.
-	origPath := os.Getenv("PATH")
-	os.Setenv("PATH", "")
-	defer os.Setenv("PATH", origPath)
-
-	// Call the real implementation directly — TestMain stubs the package
-	// variable to a nil-returning func for the rest of the suite.
-	err := realVerifyChecksumsAttestationFn("test/repo", "/nonexistent/checksums.txt")
+	err := realVerifyChecksumsAttestationFn("test/repo", "", "/nonexistent/checksums.txt")
 	if err == nil {
-		t.Fatal("expected error when gh is absent (fail closed), got nil")
+		t.Fatal("expected error when tag is empty (fail closed), got nil")
 	}
-	if !strings.Contains(err.Error(), "gh CLI required") {
-		t.Errorf("error should explain gh is required, got: %v", err)
+	if !strings.Contains(err.Error(), "release tag is required") {
+		t.Errorf("error should explain the tag is required, got: %v", err)
+	}
+}
+
+// TestVerifyChecksumsAttestation_MissingFileFailsClosed verifies the real
+// implementation fails closed when checksums.txt cannot be read/hashed. This
+// fails before any network access — a stock host without a reachable
+// attestation still refuses to install rather than proceeding unverified.
+func TestVerifyChecksumsAttestation_MissingFileFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	err := realVerifyChecksumsAttestationFn("test/repo", "v1.0.0", "/nonexistent/checksums.txt")
+	if err == nil {
+		t.Fatal("expected fail-closed error when checksums.txt is missing, got nil")
 	}
 }
 
 // TestVerifyChecksumsAttestation_FailsClosedWithoutSkip verifies that the
-// wrapper refuses the update when gh is absent and SkipAttestation is false.
+// wrapper refuses the update (rather than silently passing) when SkipAttestation
+// is false and provenance cannot be established.
 func TestVerifyChecksumsAttestation_FailsClosedWithoutSkip(t *testing.T) {
-	// Not parallel: mutates the process-wide PATH and the package-level
-	// verifyChecksumsAttestationFn.
+	// Not parallel: mutates the package-level verifyChecksumsAttestationFn.
 	origFn := verifyChecksumsAttestationFn
 	verifyChecksumsAttestationFn = realVerifyChecksumsAttestationFn
 	defer func() { verifyChecksumsAttestationFn = origFn }()
-
-	origPath := os.Getenv("PATH")
-	os.Setenv("PATH", "")
-	defer os.Setenv("PATH", origPath)
 
 	u := New(Config{
 		InstallDir:      t.TempDir(),
@@ -829,9 +832,10 @@ func TestVerifyChecksumsAttestation_FailsClosedWithoutSkip(t *testing.T) {
 		SkipAttestation: false,
 	})
 
-	err := u.verifyChecksumsAttestation("/nonexistent/checksums.txt")
+	// Missing checksums file fails before any network call → deterministic.
+	err := u.verifyChecksumsAttestation("v1.0.0", "/nonexistent/checksums.txt")
 	if err == nil {
-		t.Fatal("expected fail-closed error when gh absent and SkipAttestation=false, got nil")
+		t.Fatal("expected fail-closed error when SkipAttestation=false, got nil")
 	}
 }
 
@@ -846,7 +850,7 @@ func TestVerifyChecksumsAttestation_SkipConfig(t *testing.T) {
 		SkipAttestation: true,
 	})
 
-	err := u.verifyChecksumsAttestation("/nonexistent/checksums.txt")
+	err := u.verifyChecksumsAttestation("v1.0.0", "/nonexistent/checksums.txt")
 	if err != nil {
 		t.Errorf("SkipAttestation=true should return nil, got: %v", err)
 	}

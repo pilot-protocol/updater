@@ -54,12 +54,13 @@ type Config struct {
 
 	// SkipAttestation disables SLSA attestation verification of
 	// checksums.txt. This is the ONLY way to bypass attestation: when
-	// false (the default) and the gh CLI is absent, verification fails
-	// closed and the update is refused. Intended for test environments
-	// where the test repos do not have real attestations. Leaving it
-	// false in production keeps provenance verification mandatory.
-	// The SHA256 checksums.txt match is always enforced regardless of
-	// this flag.
+	// false (the default), the updater fetches the GitHub SLSA provenance
+	// bundle and verifies it in-process with sigstore-go (no gh CLI, no
+	// external tooling required); if it cannot verify, the update is
+	// refused (fails closed). Intended for test environments where the
+	// test repos do not have real attestations. Leaving it false in
+	// production keeps provenance verification mandatory. The SHA256
+	// checksums.txt match is always enforced regardless of this flag.
 	SkipAttestation bool
 
 	// StatePath, when non-empty, points to a JSON control file
@@ -404,12 +405,14 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 
 	// Verify checksums.txt provenance via GitHub SLSA attestation.
 	// The release workflow attests checksums.txt via
-	// actions/attest-build-provenance@v2 (PILOT-120, PR #166).
-	// This closes the "attacker publishes matched fake binary +
-	// fake checksums.txt" gap — the attestation ties checksums.txt
-	// to the trusted CI workflow. Fails closed when the gh CLI is
-	// unavailable unless SkipAttestation is explicitly set.
-	if err := u.verifyChecksumsAttestation(checksumsPath); err != nil {
+	// actions/attest-build-provenance (PILOT-120, PR #166). This closes
+	// the "attacker publishes matched fake binary + fake checksums.txt"
+	// gap — the attestation ties checksums.txt to the trusted CI
+	// workflow. Verification is done in-process via sigstore-go (no gh
+	// CLI required) and is bound to release.TagName so an older,
+	// still-attested checksums.txt cannot be replayed under a new tag
+	// (validated rollback). Fails closed unless SkipAttestation is set.
+	if err := u.verifyChecksumsAttestation(release.TagName, checksumsPath); err != nil {
 		return fmt.Errorf("checksums attestation verification failed: %w", err)
 	}
 
@@ -772,49 +775,32 @@ func (u *Updater) signalDaemonRestartLinux() {
 	slog.Warn("daemon process not found — restart daemon manually")
 }
 
-// verifyChecksumsAttestation verifies the SLSA provenance of checksums.txt
-// via the GitHub CLI's attestation verify command. The release workflow
-// (release.yml) attests checksums.txt via actions/attest-build-provenance@v2
-// (PILOT-120, PR #166). This closes the "attacker publishes matched fake
-// binary + fake checksums.txt" gap — the attestation ties checksums.txt to
-// the trusted CI workflow identity.
+// verifyChecksumsAttestation verifies the SLSA provenance of checksums.txt for
+// the given release tag. The release workflow attests checksums.txt via
+// actions/attest-build-provenance (PILOT-120, PR #166). This closes the
+// "attacker publishes matched fake binary + fake checksums.txt" gap — the
+// attestation ties checksums.txt to the trusted CI workflow identity — and
+// binds to the tag so a previously-attested checksums.txt cannot be replayed
+// under a different release.
 //
-// This gate FAILS CLOSED: if the gh CLI is not on PATH, verification returns
-// an error and the update does not proceed. The only way to skip attestation
-// is to set Config.SkipAttestation explicitly — there is no implicit skip.
-// This is deliberate: the prior "gh absent => pass" behaviour silently
-// disabled the entire provenance gate on headless production hosts (install.sh
-// never installs gh), collapsing auto-update integrity back to "anyone with
-// GitHub repo-write access can ship a malicious release."
-func (u *Updater) verifyChecksumsAttestation(checksumsPath string) error {
+// The gate FAILS CLOSED: verification is performed in-process with sigstore-go
+// (no gh CLI, no external tooling). If the provenance bundle cannot be fetched
+// or cryptographically verified, an error is returned and the update does not
+// proceed. The only way to skip attestation is Config.SkipAttestation — there
+// is no implicit skip. This is deliberate: the prior "gh absent => fail"
+// behaviour combined with headless hosts that never install gh meant
+// auto-update could never apply; verifying in-process keeps provenance
+// mandatory AND makes auto-update actually work on a stock install.
+func (u *Updater) verifyChecksumsAttestation(tag, checksumsPath string) error {
 	if u.config.SkipAttestation {
 		slog.Warn("SLSA attestation verification disabled (SkipAttestation=true) — checksums provenance is NOT verified")
 		return nil
 	}
-	return verifyChecksumsAttestationFn(u.config.Repo, checksumsPath)
+	return verifyChecksumsAttestationFn(u.config.Repo, tag, checksumsPath)
 }
 
 // verifyChecksumsAttestationFn is the attestation verification implementation
 // used by the updater. Tests may replace it to avoid requiring a real GitHub
 // repo with SLSA attestations; they restore realVerifyChecksumsAttestationFn
-// to exercise the production path.
+// to exercise the production path. See attestation.go for the implementation.
 var verifyChecksumsAttestationFn = realVerifyChecksumsAttestationFn
-
-// realVerifyChecksumsAttestationFn is the production attestation check. It
-// fails closed when gh is absent: callers only reach this function when
-// SkipAttestation is false, so a missing gh means provenance cannot be
-// established and the update must be refused.
-func realVerifyChecksumsAttestationFn(repo, checksumsPath string) error {
-	ghPath, err := exec.LookPath("gh")
-	if err != nil {
-		return fmt.Errorf("gh CLI required for SLSA attestation verification; install gh (https://cli.github.com/) or set SkipAttestation to bypass: %w", err)
-	}
-
-	cmd := exec.Command(ghPath, "attestation", "verify", checksumsPath, "--repo", repo)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("gh attestation verify: %s: %w", strings.TrimSpace(string(output)), err)
-	}
-	slog.Info("checksums provenance verified via SLSA attestation")
-	return nil
-}
