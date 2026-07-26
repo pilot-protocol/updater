@@ -177,11 +177,13 @@ func TestSemver_NewerThan_AllBranches(t *testing.T) {
 		a, b Semver
 		want bool
 	}{
-		{Semver{2, 0, 0}, Semver{1, 9, 9}, true},
-		{Semver{1, 2, 0}, Semver{1, 1, 9}, true},
-		{Semver{1, 1, 2}, Semver{1, 1, 1}, true},
-		{Semver{1, 1, 1}, Semver{1, 1, 1}, false},
-		{Semver{1, 0, 0}, Semver{2, 0, 0}, false},
+		{Semver{2, 0, 0, ""}, Semver{1, 9, 9, ""}, true},
+		{Semver{1, 2, 0, ""}, Semver{1, 1, 9, ""}, true},
+		{Semver{1, 1, 2, ""}, Semver{1, 1, 1, ""}, true},
+		{Semver{1, 1, 1, ""}, Semver{1, 1, 1, ""}, false},
+		{Semver{1, 0, 0, ""}, Semver{2, 0, 0, ""}, false},
+		{Semver{1, 1, 1, ""}, Semver{1, 1, 1, "rc1"}, true},
+		{Semver{1, 1, 1, "rc1"}, Semver{1, 1, 1, ""}, false},
 	}
 	for _, tc := range cases {
 		if got := tc.a.NewerThan(tc.b); got != tc.want {
@@ -193,7 +195,10 @@ func TestSemver_NewerThan_AllBranches(t *testing.T) {
 // TestSemver_String covers the stringer.
 func TestSemver_String(t *testing.T) {
 	t.Parallel()
-	if got := (Semver{1, 2, 3}).String(); got != "v1.2.3" {
+	if got := (Semver{1, 2, 3, ""}).String(); got != "v1.2.3" {
+		t.Errorf("String = %q", got)
+	}
+	if got := (Semver{1, 2, 3, "beta.1"}).String(); got != "v1.2.3-beta.1" {
 		t.Errorf("String = %q", got)
 	}
 }

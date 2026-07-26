@@ -37,12 +37,15 @@ func TestParseSemver(t *testing.T) {
 		want    Semver
 		wantErr bool
 	}{
-		{"v1.2.3", Semver{1, 2, 3}, false},
-		{"1.2.3", Semver{1, 2, 3}, false},
-		{"v0.0.1", Semver{0, 0, 1}, false},
-		{"v10.20.30", Semver{10, 20, 30}, false},
-		{"v1.2.3-dirty", Semver{1, 2, 3}, false},
-		{"v1.6.2-rc1", Semver{1, 6, 2}, false},
+		{"v1.2.3", Semver{1, 2, 3, ""}, false},
+		{"1.2.3", Semver{1, 2, 3, ""}, false},
+		{"v0.0.1", Semver{0, 0, 1, ""}, false},
+		{"v10.20.30", Semver{10, 20, 30, ""}, false},
+		{"v1.2.3-dirty", Semver{1, 2, 3, "dirty"}, false},
+		{"v1.6.2-rc1", Semver{1, 6, 2, "rc1"}, false},
+		{"v1.2.3-beta.2", Semver{1, 2, 3, "beta.2"}, false},
+		{"v1.2.3+build.7", Semver{1, 2, 3, ""}, false},
+		{"v1.2.3-rc.1+build.7", Semver{1, 2, 3, "rc.1"}, false},
 		{"", Semver{}, true},
 		{"v1.2", Semver{}, true},
 		{"v1.2.x", Semver{}, true},
@@ -77,6 +80,21 @@ func TestSemverNewerThan(t *testing.T) {
 		{"v1.2.3", "v1.3.0", false},
 		{"v1.2.3", "v2.0.0", false},
 		{"v0.0.1", "v0.0.0", true},
+
+		// A prerelease sorts below the release it leads up to.
+		{"v1.2.3", "v1.2.3-rc1", true},
+		{"v1.2.3-rc1", "v1.2.3", false},
+		{"v1.2.3-rc1", "v1.2.3-rc1", false},
+		{"v1.2.3-rc2", "v1.2.3-rc1", true},
+		{"v1.2.3-rc1", "v1.2.3-rc2", false},
+		{"v1.2.3-beta.2", "v1.2.3-beta.1", true},
+		{"v1.2.3-rc.1", "v1.2.3-beta.9", true},
+		{"v1.2.3-rc.1", "v1.2.2", true},
+		{"v1.2.3-rc.1", "v1.2.4", false},
+		{"v1.2.3-rc.1.1", "v1.2.3-rc.1", true},
+		{"v1.2.3-1", "v1.2.3-alpha", false},
+		{"v1.2.3-alpha", "v1.2.3-1", true},
+		{"v1.2.3+build.7", "v1.2.3", false},
 	}
 
 	for _, tt := range tests {
@@ -93,9 +111,47 @@ func TestSemverNewerThan(t *testing.T) {
 
 func TestSemverString(t *testing.T) {
 	t.Parallel()
-	v := Semver{1, 6, 3}
+	v := Semver{1, 6, 3, ""}
 	if s := v.String(); s != "v1.6.3" {
 		t.Fatalf("String() = %q, want %q", s, "v1.6.3")
+	}
+	if s := (Semver{1, 6, 3, "rc1"}).String(); s != "v1.6.3-rc1" {
+		t.Fatalf("String() = %q, want %q", s, "v1.6.3-rc1")
+	}
+}
+
+// TestSemverPinEquality checks that an exact pin only matches a tag with the
+// same prerelease suffix, which is how checkPinnedVersion decides whether the
+// pinned release is already installed.
+func TestSemverPinEquality(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		pin, installed string
+		want           bool
+	}{
+		{"v1.2.3", "v1.2.3", true},
+		{"v1.2.3", "v1.2.3-rc1", false},
+		{"v1.2.3-rc1", "v1.2.3", false},
+		{"v1.2.3-rc1", "v1.2.3-rc1", true},
+		{"v1.2.3-rc1", "v1.2.3-rc2", false},
+		{"v1.2.3", "v1.2.3+build.7", true},
+	}
+
+	for _, tt := range tests {
+		name := fmt.Sprintf("%s==%s", tt.pin, tt.installed)
+		t.Run(name, func(t *testing.T) {
+			pin, err := ParseSemver(tt.pin)
+			if err != nil {
+				t.Fatalf("ParseSemver(%q): %v", tt.pin, err)
+			}
+			installed, err := ParseSemver(tt.installed)
+			if err != nil {
+				t.Fatalf("ParseSemver(%q): %v", tt.installed, err)
+			}
+			if got := installed == pin; got != tt.want {
+				t.Fatalf("%q == %q = %v, want %v", tt.installed, tt.pin, got, tt.want)
+			}
+		})
 	}
 }
 
