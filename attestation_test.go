@@ -193,8 +193,20 @@ func TestRealVerify_EndToEnd_v1_12_5(t *testing.T) {
 	}
 }
 
+// isRateLimited reports whether err is GitHub throttling us rather than a
+// genuine verification failure. Unauthenticated callers get two distinct
+// responses: 403 for the plain hourly rate limit, and 429 for secondary
+// ("abuse detection") limits. The 429 body says "abuse detection mechanism"
+// and only ever spells the phrase hyphenated ("abuse-rate-limits"), so
+// neither of the original patterns matched it and the test hard-failed.
 func isRateLimited(err error) bool {
-	return err != nil && (containsAny(err.Error(), "returned 403", "rate limit"))
+	return err != nil && containsAny(err.Error(),
+		"returned 403",
+		"returned 429",
+		"rate limit",
+		"rate-limit",
+		"abuse detection",
+	)
 }
 
 func containsAny(s string, subs ...string) bool {
