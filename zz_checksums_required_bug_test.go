@@ -63,7 +63,7 @@ func TestApplyUpdate_FailsWhenChecksumsAssetMissing(t *testing.T) {
 		},
 	}
 
-	err := u.applyUpdate(release)
+	_, err := u.applyUpdate(release)
 	if err == nil {
 		// Confirm the malicious binary was installed unverified.
 		got, _ := os.ReadFile(filepath.Join(installDir, "pilot-daemon"))
@@ -129,7 +129,7 @@ func TestApplyUpdate_FailsWhenChecksumsDownloadFails(t *testing.T) {
 		},
 	}
 
-	err := u.applyUpdate(release)
+	_, err := u.applyUpdate(release)
 	if err == nil {
 		got, _ := os.ReadFile(filepath.Join(installDir, "pilot-daemon"))
 		t.Fatalf(
@@ -192,7 +192,7 @@ func TestApplyUpdate_PassesWithValidChecksums(t *testing.T) {
 		},
 	}
 
-	if err := u.applyUpdate(release); err != nil {
+	if _, err := u.applyUpdate(release); err != nil {
 		t.Fatalf("green-path install failed: %v", err)
 	}
 }
@@ -254,7 +254,7 @@ func TestApplyUpdate_SkipAttestationStillRequiresChecksum(t *testing.T) {
 			stopCh: make(chan struct{}),
 			exitFn: func(int) {},
 		}
-		if err := u.applyUpdate(newRelease(srv.URL)); err != nil {
+		if _, err := u.applyUpdate(newRelease(srv.URL)); err != nil {
 			t.Fatalf("SkipAttestation=true with matching checksum should install: %v", err)
 		}
 	})
@@ -280,7 +280,7 @@ func TestApplyUpdate_SkipAttestationStillRequiresChecksum(t *testing.T) {
 			stopCh: make(chan struct{}),
 			exitFn: func(int) {},
 		}
-		err := u.applyUpdate(newRelease(srv.URL))
+		_, err := u.applyUpdate(newRelease(srv.URL))
 		if err == nil {
 			t.Fatal("SkipAttestation=true must still enforce SHA256: mismatch should fail")
 		}

@@ -160,7 +160,7 @@ func TestApplyUpdate_TamperedArchiveRefused(t *testing.T) {
 		},
 	}
 
-	err := u.applyUpdate(release)
+	_, err := u.applyUpdate(release)
 	if err == nil {
 		t.Fatal("tampered archive (bytes swapped, checksums valid for original) must be refused")
 	}
