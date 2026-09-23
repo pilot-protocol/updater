@@ -4,10 +4,12 @@ package updater
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -42,10 +44,12 @@ const (
 // whether updates are actually working, instead of only whether they are
 // switched on.
 //
-// The file is shared by the long-running updater service and one-shot
-// `pilotctl update` runs: each writer merges its fields into what is already
-// on disk, so a manual run keeps the loop's LoopPID/NextCheckAt and the loop
-// keeps the failure streak a manual run started.
+// The file can be shared by the long-running updater service and one-shot
+// RunOnce callers configured with the same StatusPath (or StatePath). Each
+// writer takes an advisory lock (StatusFileName + ".lock") and merges its
+// fields into what is already on disk, so a manual run keeps the loop's
+// LoopPID/NextCheckAt and the loop keeps the failure streak a manual run
+// started. A RunOnce caller with neither path set writes nothing.
 type Status struct {
 	// UpdaterVersion is the version of the updater that wrote the record.
 	UpdaterVersion string `json:"updater_version,omitempty"`
@@ -77,8 +81,13 @@ type Status struct {
 	LastUpdateAt      time.Time `json:"last_update_at,omitzero"`
 	LastUpdateVersion string    `json:"last_update_version,omitempty"`
 	// RestartError is set when new binaries were installed but the daemon
-	// could not be restarted onto them (it keeps running the old version
-	// until restarted by hand). Cleared by the next successful restart.
+	// is not running them: it was left on the old version, or it was
+	// stopped and did not come back. It says how to restart it. On Linux the
+	// updater stops the daemon only when systemd will start it again, so a
+	// daemon without such a service (e.g. `pilotctl daemon start` in a
+	// container) is left running and reported here. Cleared by the next
+	// successful restart and, on Linux, by the next check that finds the
+	// daemon running the installed binary.
 	RestartError string `json:"restart_error,omitempty"`
 
 	// LoopPID and LoopStartedAt identify the long-running updater process
@@ -128,9 +137,11 @@ func (u *Updater) LastStatus() Status {
 
 // updateStatus applies mutate to the current status and persists it. The
 // base is the file on disk (so fields written by another process survive);
-// when the file is missing or unreadable the in-memory copy is used. Write
-// failures are logged, never returned: recording the outcome must not change
-// the outcome.
+// when the file is missing or unreadable the in-memory copy is used. The
+// read-merge-write runs under statusMu (this process) and an advisory file
+// lock (other processes), so concurrent writers do not drop each other's
+// changes. Write failures are logged, never returned: recording the outcome
+// must not change the outcome.
 func (u *Updater) updateStatus(mutate func(*Status)) {
 	u.statusMu.Lock()
 	defer u.statusMu.Unlock()
@@ -138,6 +149,12 @@ func (u *Updater) updateStatus(mutate func(*Status)) {
 	path := u.statusPath()
 	base := u.status
 	if path != "" {
+		wait := u.statusLockWait
+		if wait <= 0 {
+			wait = defaultStatusLockWait
+		}
+		unlock := lockStatusFile(path, wait)
+		defer unlock()
 		if onDisk, err := ReadStatus(path); err == nil {
 			base = onDisk
 		}
@@ -152,6 +169,50 @@ func (u *Updater) updateStatus(mutate func(*Status)) {
 	}
 	if err := writeStatusFile(path, base); err != nil {
 		slog.Warn("failed to write update status file", "path", path, "error", err)
+	}
+}
+
+// defaultStatusLockWait bounds how long a writer waits for another
+// process's read-merge-write of the status file (each holds the lock for a
+// few milliseconds). After it, the write goes ahead unlocked: recording the
+// outcome must never block an update.
+const defaultStatusLockWait = 5 * time.Second
+
+// lockStatusFile takes an exclusive advisory lock (flock) on path + ".lock",
+// a sidecar file: path itself is replaced by rename on every write, so it
+// cannot carry the lock. It returns the function that releases the lock. If
+// the lock cannot be taken within wait it logs why and returns a no-op.
+func lockStatusFile(path string, wait time.Duration) (unlock func()) {
+	noop := func() {}
+	lockPath := path + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		slog.Warn("cannot lock update status file; writing unlocked", "path", lockPath, "error", err)
+		return noop
+	}
+	// Read-only is enough for flock and works when another user (e.g. a
+	// `sudo pilotctl update`) created the lock file.
+	f, err := os.OpenFile(lockPath, os.O_RDONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		slog.Warn("cannot lock update status file; writing unlocked", "path", lockPath, "error", err)
+		return noop
+	}
+	fd := int(f.Fd()) // #nosec G115 -- a file descriptor always fits in an int
+	deadline := time.Now().Add(wait)
+	for {
+		err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return func() {
+				_ = syscall.Flock(fd, syscall.LOCK_UN)
+				_ = f.Close()
+			}
+		}
+		retry := errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EINTR)
+		if !retry || !time.Now().Before(deadline) {
+			slog.Warn("cannot lock update status file; writing unlocked", "path", lockPath, "error", err)
+			_ = f.Close()
+			return noop
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -203,6 +264,10 @@ type checkOutcome struct {
 	// restartErr is the error from restarting the daemon onto the new
 	// binaries, if that failed.
 	restartErr error
+	// daemonCurrent reports that, with nothing installed by this check, the
+	// daemon was found running the installed binary (Linux only), so an
+	// earlier restart_error no longer applies.
+	daemonCurrent bool
 }
 
 // recordCheck persists the outcome of one check.
@@ -212,6 +277,9 @@ func (u *Updater) recordCheck(trigger string, out checkOutcome, checkErr error) 
 		s.PinnedVersion = u.config.PinnedVersion
 		s.LastCheckAt = now
 		s.LastCheckTrigger = trigger
+		if out.installed == "" && out.daemonCurrent {
+			s.RestartError = ""
+		}
 		if out.latest != "" {
 			s.LatestVersion = out.latest
 		}

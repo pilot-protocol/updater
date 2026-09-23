@@ -28,24 +28,64 @@ u := updater.New(updater.Config{
 u.Start()
 ```
 
-One-shot check (what `pilotctl update` does):
+One-shot check, for `pilotctl update` and similar commands:
 
 ```go
 u := updater.New(updater.Config{
     Repo:       "pilot-protocol/pilotprotocol",
     InstallDir: "/home/user/.pilot/bin",
-    StatusPath: "/home/user/.pilot/update-state.json",
+    StatusPath: "/home/user/.pilot/update-state.json", // record the run
 })
 if err := u.RunOnce(); err != nil {
     // The check failed: report it and exit non-zero.
 }
 st := u.LastStatus() // st.LastResult is "up_to_date" or "updated"
+if st.RestartError != "" {
+    // Installed, but the daemon still runs the old version. The message
+    // says how to restart it.
+}
 ```
 
 `RunOnce` returns the check's error. It never exits the calling process. If
 the release replaced `pilot-updater`, the daemon is still restarted onto the
 new binaries. A running updater service switches to its new binary the next
 time its service manager restarts it.
+
+A `RunOnce` caller writes the status file only when it sets `StatusPath` (or
+`StatePath`); otherwise only `LastStatus()` has the result. **`pilotctl
+update` does not do this yet.** As of web4 `main` on 2026-09-24,
+`cmd/pilotctl/updates.go` sets neither path and ignores the error `RunOnce`
+returns. So manual updates are not recorded in `update-state.json`, and a
+failed `pilotctl update` still prints success and exits 0. That stays true
+until pilotctl passes `StatusPath: ~/.pilot/update-state.json` and checks the
+error, which needs a web4 change after this version is released.
+
+### Restarting the daemon
+
+After installing new binaries the updater restarts the daemon onto them:
+
+- **macOS:** `launchctl kickstart -k gui/<uid>/network.pilotprotocol.pilot-daemon`.
+- **Linux:** SIGTERM, but only when systemd will start the daemon again. The
+  daemon must run as the main program (`ExecStart=`) of a system service whose
+  unit restarts it after a clean exit. pilot-daemon exits 0 on SIGTERM, so
+  that means `Restart=always` or `on-success`. The updater finds the service
+  from `/proc/<pid>/cgroup` and reads the unit file and its drop-ins. It does
+  not run `systemctl`. After the SIGTERM it waits up to 30 s for a new daemon
+  process on the new binary.
+
+On Linux the daemon is left running the old version, with `restart_error`
+saying how to restart it, when:
+
+- it was started with `pilotctl daemon start`, which is how containers, WSL
+  and CI run it because install.sh sets up no service there;
+- its unit has `Restart=on-failure`, as written by install.sh up to v1.9.0.
+  Updates never rewrite the unit, and systemd does not restart a clean exit
+  under that policy. Re-running install.sh rewrites the unit with
+  `Restart=always`;
+- it runs under a systemd user service, or inside another service, such as a
+  CI runner.
+
+Stopping the daemon in any of those cases would take the node offline.
 
 ### Pinning a version
 
@@ -77,9 +117,16 @@ and a node could fail every hourly check for weeks without anyone noticing.
 
 The file goes to `Config.StatusPath`. When that is empty and `StatePath` is
 set, it goes next to the control file. For a standard install that is
-`~/.pilot/auto-update.json` → `~/.pilot/update-state.json`. The long-running
-updater and one-shot `pilotctl update` runs share the file: each writer
-merges its fields into what is already there, and writes are atomic.
+`~/.pilot/auto-update.json` → `~/.pilot/update-state.json`. With neither
+set, nothing is written.
+
+The long-running updater and any one-shot `RunOnce` caller configured with
+the same path share the file. `pilotctl update` does not pass one yet (see
+above). Each writer takes an advisory lock on `update-state.json.lock` and
+merges its fields into what is already there, so concurrent writers from
+different processes do not lose each other's changes. Writes are atomic
+(temp file + rename). A writer that cannot get the lock within 5 s writes
+anyway and logs a warning.
 
 ```json
 {
@@ -108,7 +155,7 @@ merges its fields into what is already there, and writes are atomic.
 | `consecutive_failures` | Failed checks since the last success. |
 | `last_success_at` | The last check that completed without error. |
 | `current_version` / `latest_version` | The installed release, and the release it was compared against (the pin, when pinned). |
-| `restart_error` | New binaries were installed but the daemon could not be restarted onto them. Cleared by the next successful restart. |
+| `restart_error` | New binaries were installed but the daemon is not running them. Either it was left on the old version because stopping it would have left it down (see [Restarting the daemon](#restarting-the-daemon)) or the restart failed, or it was stopped and did not come back. Says how to restart it. Cleared by the next successful restart, and on Linux by the next check that finds the daemon running the installed binary. |
 | `loop_pid`, `loop_started_at` | The long-running updater process. |
 | `next_check_at` | When the loop wakes next. It is updated even while auto-update is disabled, so it doubles as a heartbeat. |
 
@@ -117,7 +164,7 @@ Suggested readings for `pilotctl update status` and similar tools:
 - **Updates failing:** `consecutive_failures > 0`. Show `last_error`.
 - **Updates stalled:** `last_success_at` is more than 48 hours old while auto-update is enabled.
 - **No updater running:** auto-update is enabled, but the file is missing, `loop_pid` is not alive, or `next_check_at` is more than one interval in the past. This happens on Linux without systemd (containers, WSL, CI), where the installer cannot start the updater.
-- **Daemon on the old version:** `restart_error` is set. Restart the daemon by hand.
+- **Daemon on the old version:** `restart_error` is set. Show it: it names the command that restarts the daemon.
 
 Use `updater.ReadStatus(path)` to read the file. A missing file returns an
 error matching `errors.Is(err, fs.ErrNotExist)`.
@@ -164,8 +211,9 @@ The SHA-256 match against the attested `checksums.txt` still gates every install
 The updater never runs `gh` or any other external tool. It checks the SLSA
 provenance of `checksums.txt` in-process with sigstore-go
 (`attestation.go`). The only command it runs is `launchctl kickstart`, which
-restarts the daemon under launchd on macOS. `TestNoExternalToolDependency`
-fails the build if another exec is added.
+restarts the daemon under launchd on macOS. On Linux it reads `/proc` and the
+systemd unit files directly instead of running `systemctl`.
+`TestNoExternalToolDependency` fails the build if another exec is added.
 
 ### Nodes stuck on v1.12.2–v1.13.4 (updater v0.2.3)
 
@@ -173,8 +221,9 @@ pilotprotocol releases **v1.12.2 through v1.13.4** shipped updater v0.2.3,
 which ran `gh attestation verify` and refused every update when `gh` was not
 on its `PATH`. Service managers never put `gh` on the `PATH`: launchd's default is
 `/usr/bin:/bin:/usr/sbin:/sbin`, and most Linux hosts have no `gh` at all. So
-those nodes cannot update themselves. `~/.pilot/updater.log` shows an hourly
-`gh CLI required for SLSA attestation verification` error.
+those nodes cannot update themselves. The updater log shows an hourly
+`gh CLI required for SLSA attestation verification` error. On macOS the log
+is `~/.pilot/updater.log`. On Linux, read it with `journalctl -u pilot-updater`.
 
 The broken updater cannot fix itself. On an affected node, do one of these:
 
@@ -203,6 +252,7 @@ because that switches off provenance checks.
 | File | What it does |
 |---|---|
 | `updater.go` | `Updater`: check loop, `RunOnce`, release polling, install, daemon restart. |
+| `supervisor.go` | Linux restart safety: finds the daemon's systemd service and checks its restart policy before any SIGTERM. |
 | `download.go` | Resumable asset downloads with idle and total-duration limits. |
 | `github.go` | GitHub API calls: optional `GITHUB_TOKEN`, rate-limit errors. |
 | `attestation.go` | In-process SLSA provenance verification of `checksums.txt` (sigstore-go). |

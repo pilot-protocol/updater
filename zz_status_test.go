@@ -22,9 +22,11 @@ import (
 )
 
 // restartSpy captures daemon-restart attempts on both platforms: launchctl
-// on macOS (runCmd) and SIGTERM via a fake /proc on Linux (killFn). The fake
-// /proc holds one daemon whose exe reads "<path> (deleted)", which is what a
-// real daemon looks like right after its binary was renamed over.
+// on macOS (runCmd) and SIGTERM on Linux (killFn). On Linux the daemon is a
+// fake /proc entry whose exe reads "<path> (deleted)", which is what a real
+// daemon looks like right after its binary was renamed over. It runs in
+// pilot-daemon.service with Restart=always, and after a successful SIGTERM
+// the fake systemd starts it again on the installed binary.
 type restartSpy struct {
 	mu    sync.Mutex
 	calls []string
@@ -42,21 +44,17 @@ func (r *restartSpy) install(t *testing.T, u *Updater) {
 		}
 		return nil, nil
 	}
-	proc := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(proc, "3999999"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	exe := filepath.Join(u.config.InstallDir, "pilot-daemon") + " (deleted)"
-	if err := os.Symlink(exe, filepath.Join(proc, "3999999", "exe")); err != nil {
-		t.Fatal(err)
-	}
-	u.procRoot = proc
-	u.killFn = func(pid int, sig syscall.Signal) error {
+	sys := newFakeSystem(t, u.config.InstallDir)
+	sys.addReplacedDaemon(3999999, cgroupPilotService)
+	sys.writeFile("pilot-daemon.service", daemonUnit(sys.daemon, "always"))
+	sys.restarts = true
+	sys.onKill = func(pid int, sig syscall.Signal) error {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		r.calls = append(r.calls, fmt.Sprintf("kill %d %d", pid, sig))
 		return r.fail
 	}
+	sys.attach(u)
 }
 
 func (r *restartSpy) count() int {

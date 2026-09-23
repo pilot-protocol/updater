@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -96,13 +95,18 @@ type Updater struct {
 	dlIdleTimeout  time.Duration // 0 = defaultDownloadIdleTimeout
 	dlRetryBackoff time.Duration // base pause between download attempts
 
-	// Process hooks, injectable for tests. Nil means the real thing.
-	runCmd   func(name string, args ...string) ([]byte, error)
-	killFn   func(pid int, sig syscall.Signal) error
-	procRoot string // "" = /proc
+	// Process hooks, injectable for tests. Zero values mean the real thing.
+	runCmd      func(name string, args ...string) ([]byte, error)
+	killFn      func(pid int, sig syscall.Signal) error
+	procRoot    string        // "" = /proc
+	goos        string        // "" = runtime.GOOS; selects the restart mechanism
+	systemdDirs []string      // nil = systemdSystemUnitDirs
+	restartWait time.Duration // 0 = defaultRestartWait
+	restartPoll time.Duration // 0 = defaultRestartPoll
 
-	statusMu sync.Mutex
-	status   Status
+	statusMu       sync.Mutex
+	status         Status
+	statusLockWait time.Duration // 0 = defaultStatusLockWait
 }
 
 // runCommand runs an external command and returns its combined output. The
@@ -265,6 +269,11 @@ func (u *Updater) checkOnce() error {
 // error.
 func (u *Updater) runCheck(trigger string) error {
 	out, err := u.check()
+	if out.installed == "" {
+		// A daemon now running the installed binary (restarted by hand after
+		// an earlier restart failure) settles restart_error.
+		out.daemonCurrent = u.daemonOnInstalledBinary()
+	}
 	if err != nil {
 		slog.Error("update check failed", "trigger", trigger, "error", err)
 		u.recordCheck(trigger, out, err)
@@ -792,7 +801,7 @@ func writeFileSync(path string, data []byte, perm os.FileMode) error {
 // binary; a daemon that is not running at all is not an error (its next
 // start uses the new binary).
 func (u *Updater) signalDaemonRestart() error {
-	if runtime.GOOS == "darwin" {
+	if u.targetOS() == "darwin" {
 		return u.signalDaemonRestartDarwin()
 	}
 	return u.signalDaemonRestartLinux()
@@ -825,14 +834,11 @@ func (u *Updater) signalDaemonRestartDarwin() error {
 }
 
 func (u *Updater) signalDaemonRestartLinux() error {
-	// On Linux, find the daemon process via /proc/<pid>/exe and send SIGTERM.
-	// systemd (Restart=always in the unit install.sh writes) relaunches it on
-	// the new binary.
+	// On Linux, find the daemon process via /proc/<pid>/exe. When systemd
+	// will start it again (see supervisor.go), send SIGTERM and wait for the
+	// new process; otherwise leave it running and say how to restart it.
 	daemonPath := filepath.Join(u.config.InstallDir, "pilot-daemon")
-	procRoot := u.procRoot
-	if procRoot == "" {
-		procRoot = "/proc"
-	}
+	procRoot := u.procDir()
 	pid, err := findProcessByExe(procRoot, daemonPath)
 	if err != nil {
 		slog.Warn("cannot read /proc — restart daemon manually", "error", err)
@@ -843,7 +849,12 @@ func (u *Updater) signalDaemonRestartLinux() error {
 		slog.Warn("daemon process not found — restart daemon manually if it is running", "path", daemonPath)
 		return nil
 	}
-	slog.Info("sending SIGTERM to daemon", "pid", pid)
+	unit, err := u.daemonSupervisor(procRoot, pid, daemonPath)
+	if err != nil {
+		slog.Warn("daemon not restarted onto the new binary", "pid", pid, "reason", err)
+		return fmt.Errorf("restart daemon: %w", err)
+	}
+	slog.Info("sending SIGTERM to daemon; systemd starts it again", "pid", pid, "unit", unit)
 	kill := u.killFn
 	if kill == nil {
 		kill = syscall.Kill
@@ -851,6 +862,12 @@ func (u *Updater) signalDaemonRestartLinux() error {
 	if err := kill(pid, syscall.SIGTERM); err != nil {
 		return fmt.Errorf("restart daemon: signal pid %d: %w", pid, err)
 	}
+	newPid, err := u.waitForDaemonRestart(procRoot, daemonPath, pid, unit)
+	if err != nil {
+		slog.Error("daemon did not come back after SIGTERM", "unit", unit, "error", err)
+		return fmt.Errorf("restart daemon: %w", err)
+	}
+	slog.Info("daemon restarted on the new binary", "unit", unit, "pid", newPid)
 	return nil
 }
 
@@ -860,28 +877,15 @@ func (u *Updater) signalDaemonRestartLinux() error {
 // reads "<exePath> (deleted)". That must match too, or the daemon is never
 // restarted onto the new version.
 func findProcessByExe(procRoot, exePath string) (int, error) {
-	entries, err := os.ReadDir(procRoot)
-	if err != nil {
-		return 0, err
-	}
-	self := os.Getpid()
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid <= 0 || pid == self {
-			continue
-		}
-		exe, err := os.Readlink(filepath.Join(procRoot, entry.Name(), "exe"))
-		if err != nil {
-			continue
-		}
+	found := 0
+	err := forEachProcExe(procRoot, func(pid int, exe string) bool {
 		if exe == exePath || exe == exePath+" (deleted)" {
-			return pid, nil
+			found = pid
+			return false
 		}
-	}
-	return 0, nil
+		return true
+	})
+	return found, err
 }
 
 // verifyChecksumsAttestation verifies the SLSA provenance of checksums.txt for

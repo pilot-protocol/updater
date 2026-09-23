@@ -67,23 +67,18 @@ func TestFindProcessByExe_ExactAndMissing(t *testing.T) {
 	}
 }
 
-// TestSignalDaemonRestartLinux_Paths covers signal success, signal failure,
-// daemon not running (not an error) and unreadable /proc (an error).
+// TestSignalDaemonRestartLinux_Paths covers a supervised daemon (SIGTERM,
+// systemd starts it again), signal failure, daemon not running (not an
+// error) and unreadable /proc (an error).
 func TestSignalDaemonRestartLinux_Paths(t *testing.T) {
 	t.Parallel()
-	installDir := t.TempDir()
-	daemon := filepath.Join(installDir, "pilot-daemon")
-	root := fakeProc(t, map[string]string{"77": daemon + " (deleted)"})
+	u, sys := supervisedLinuxUpdater(t, "always")
 
 	var gotPid int
 	var gotSig syscall.Signal
-	u := &Updater{
-		config:   Config{InstallDir: installDir},
-		procRoot: root,
-		killFn: func(pid int, sig syscall.Signal) error {
-			gotPid, gotSig = pid, sig
-			return nil
-		},
+	sys.onKill = func(pid int, sig syscall.Signal) error {
+		gotPid, gotSig = pid, sig
+		return nil
 	}
 	if err := u.signalDaemonRestartLinux(); err != nil {
 		t.Fatalf("signalDaemonRestartLinux: %v", err)
@@ -92,11 +87,13 @@ func TestSignalDaemonRestartLinux_Paths(t *testing.T) {
 		t.Errorf("signalled pid %d with %v, want 77 SIGTERM", gotPid, gotSig)
 	}
 
-	u.killFn = func(int, syscall.Signal) error { return errors.New("operation not permitted") }
+	// The restarted daemon (on the installed binary) is found next time.
+	sys.onKill = func(int, syscall.Signal) error { return errors.New("operation not permitted") }
 	if err := u.signalDaemonRestartLinux(); err == nil || !strings.Contains(err.Error(), "operation not permitted") {
 		t.Errorf("kill failure = %v, want reported", err)
 	}
 
+	root := u.procRoot
 	u.procRoot = fakeProc(t, nil)
 	if err := u.signalDaemonRestartLinux(); err != nil {
 		t.Errorf("daemon not running must not be an error, got %v", err)
