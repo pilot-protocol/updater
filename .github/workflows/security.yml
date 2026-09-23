@@ -57,7 +57,10 @@ jobs:
         # golang/govulncheck-action does its own git fetch and fails with
         # "fatal: unable to access ... error: 400" on org repos. Run the tool
         # directly after checkout + setup-go (rendezvous/common pattern).
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        # Pinned: govulncheck v1.8.0+ requires Go 1.26, and setup-go runs
+        # with GOTOOLCHAIN=local on the go.mod version (1.25.x), so @latest
+        # fails before scanning anything. Bump together with the Go 1.26 move.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   # Secret scan over the full history on push, the PR range on PR.
   gitleaks:
