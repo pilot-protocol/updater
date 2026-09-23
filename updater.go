@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -72,15 +73,44 @@ type Config struct {
 	// ignoring this gate. An empty StatePath preserves the legacy
 	// always-on loop behaviour for backward compatibility.
 	StatePath string
+
+	// StatusPath is where the updater records the outcome of every check
+	// (see Status): last check time and result, last error, consecutive
+	// failures, installed and latest versions, and whether the loop is
+	// running. Empty means "update-state.json next to StatePath"; with
+	// neither set, nothing is written (LastStatus still reports it).
+	StatusPath string
 }
 
 // Updater periodically checks GitHub Releases for new versions and optionally applies them.
 type Updater struct {
 	config Config
-	client *http.Client
+	client *http.Client // GitHub API calls (short total timeout)
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 	exitFn func(int) // injectable for testing; defaults to os.Exit
+
+	// dlClient downloads release assets. It has no total timeout: see
+	// downloadFile. Nil falls back to client without its total timeout.
+	dlClient       *http.Client
+	dlIdleTimeout  time.Duration // 0 = defaultDownloadIdleTimeout
+	dlRetryBackoff time.Duration // base pause between download attempts
+
+	// Process hooks, injectable for tests. Nil means the real thing.
+	runCmd   func(name string, args ...string) ([]byte, error)
+	killFn   func(pid int, sig syscall.Signal) error
+	procRoot string // "" = /proc
+
+	statusMu sync.Mutex
+	status   Status
+}
+
+// runCommand runs an external command and returns its combined output. The
+// only command the updater ever runs is launchctl (daemon restart on macOS);
+// it never runs gh or any other tool. Tests replace this so the suite cannot
+// restart a real daemon on a developer machine.
+var runCommand = func(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
 }
 
 // GitHubRelease represents a subset of the GitHub release API response.
@@ -98,10 +128,12 @@ type GitHubAsset struct {
 // New creates a new Updater.
 func New(cfg Config) *Updater {
 	return &Updater{
-		config: cfg,
-		client: &http.Client{Timeout: 30 * time.Second},
-		stopCh: make(chan struct{}),
-		exitFn: os.Exit,
+		config:         cfg,
+		client:         &http.Client{Timeout: apiTimeout, Transport: newTransport()},
+		dlClient:       &http.Client{Transport: newTransport()},
+		dlRetryBackoff: defaultDownloadRetryBackoff,
+		stopCh:         make(chan struct{}),
+		exitFn:         os.Exit,
 	}
 }
 
@@ -124,9 +156,19 @@ func (u *Updater) Stop() {
 // `pilotctl update` and similar CLI commands. It ALWAYS runs — the
 // StatePath enabled-gate applies only to the automatic loop, so a manual
 // `pilotctl update` works even when auto-update is disabled.
-func (u *Updater) RunOnce() {
+//
+// It returns the check's error (nil when already up to date or when the
+// update was installed), so callers can report failure and exit non-zero.
+// LastStatus describes the outcome in detail, and the same record is written
+// to the status file when one is configured.
+//
+// RunOnce never exits the calling process. When the release replaces the
+// pilot-updater binary, the daemon is still restarted onto the new binaries;
+// a separately running updater service picks up its new binary the next
+// time its service manager restarts it.
+func (u *Updater) RunOnce() error {
 	u.recoverPendingRestart()
-	u.checkOnce()
+	return u.runCheck(TriggerManual)
 }
 
 // enabled reports whether the automatic update loop may apply updates. With
@@ -153,16 +195,26 @@ func (u *Updater) enabled() bool {
 func (u *Updater) checkLoop() {
 	defer u.wg.Done()
 
+	// Record that an updater loop is running, so `pilotctl update status`
+	// can tell "enabled and running" from "enabled but no updater process"
+	// (e.g. a container or WSL host without systemd).
+	started := time.Now().UTC()
+	u.updateStatus(func(s *Status) {
+		s.LoopPID = os.Getpid()
+		s.LoopStartedAt = started
+	})
+
 	// On startup, catch any missed daemon restart from a previous update cycle
 	// (e.g. old macOS updater replaced the binary but never called launchctl).
 	u.recoverPendingRestart()
 
 	// Run once immediately on start (only if auto-update is enabled).
 	if u.enabled() {
-		u.checkOnce()
+		_ = u.runCheck(TriggerAuto)
 	} else {
 		slog.Info("auto-update disabled; loop idle until enabled", "state_path", u.config.StatePath)
 	}
+	u.markNextCheck()
 
 	ticker := time.NewTicker(u.config.CheckInterval)
 	defer ticker.Stop()
@@ -185,17 +237,73 @@ func (u *Updater) checkLoop() {
 			// Re-read the gate each tick so `pilotctl update enable/disable`
 			// takes effect without restarting the updater.
 			if u.enabled() {
-				u.checkOnce()
+				_ = u.runCheck(TriggerAuto)
 			} else {
 				slog.Debug("auto-update disabled; skipping tick")
 			}
+			u.markNextCheck()
 		case <-u.stopCh:
 			return
 		}
 	}
 }
 
-func (u *Updater) checkOnce() {
+// markNextCheck records when the loop wakes up next. It doubles as the
+// loop's heartbeat: a NextCheckAt far in the past means no loop is running.
+func (u *Updater) markNextCheck() {
+	next := time.Now().UTC().Add(u.config.CheckInterval)
+	u.updateStatus(func(s *Status) { s.NextCheckAt = next })
+}
+
+// checkOnce runs one automatic (loop) check. See runCheck.
+func (u *Updater) checkOnce() error {
+	return u.runCheck(TriggerAuto)
+}
+
+// runCheck performs one update check, restarts the daemon when an update was
+// installed, records the outcome in the status file and returns the check's
+// error.
+func (u *Updater) runCheck(trigger string) error {
+	out, err := u.check()
+	if err != nil {
+		slog.Error("update check failed", "trigger", trigger, "error", err)
+		u.recordCheck(trigger, out, err)
+		return err
+	}
+	if out.installed == "" {
+		u.recordCheck(trigger, out, nil)
+		return nil
+	}
+	slog.Info("update applied successfully", "version", out.installed)
+
+	if out.updaterReplaced && trigger == TriggerAuto {
+		// This process is now running a stale updater. Record the update,
+		// then exit so launchd/systemd restarts the process with the new
+		// binary. On startup the new process runs recoverPendingRestart(),
+		// which restarts the daemon (and records the result).
+		u.recordCheck(trigger, out, nil)
+		slog.Info("updater binary replaced — exiting for process manager to restart with new binary")
+		exit := u.exitFn
+		if exit == nil {
+			exit = os.Exit
+		}
+		exit(0)
+		return nil
+	}
+	if out.updaterReplaced {
+		slog.Info("pilot-updater binary replaced; a running updater service uses it after its next restart")
+	}
+
+	// Restart the daemon onto the new binaries (SIGTERM / launchctl).
+	out.restartErr = u.signalDaemonRestart()
+	u.touchRestartRecord()
+	u.recordCheck(trigger, out, nil)
+	return nil
+}
+
+// check fetches the target release (latest, or the pinned tag) and installs
+// it when needed. It does not restart anything or exit.
+func (u *Updater) check() (checkOutcome, error) {
 	slog.Debug("checking for updates")
 
 	// Pinned-version path: install a specific version regardless of
@@ -203,45 +311,44 @@ func (u *Updater) checkOnce() {
 	// pinned version is installed, subsequent ticks are no-ops until
 	// the pin is changed or cleared.
 	if u.config.PinnedVersion != "" {
-		u.checkPinnedVersion()
-		return
+		return u.checkPinnedVersion()
 	}
 
 	// Default path: follow the latest release.
+	var out checkOutcome
 	release, err := u.fetchLatestRelease()
 	if err != nil {
-		slog.Error("failed to fetch latest release", "error", err)
-		return
+		return out, fmt.Errorf("fetch latest release: %w", err)
 	}
 
 	latest, err := ParseSemver(release.TagName)
 	if err != nil {
-		slog.Error("failed to parse release tag", "tag", release.TagName, "error", err)
-		return
+		return out, fmt.Errorf("parse release tag %q: %w", release.TagName, err)
 	}
+	out.latest = release.TagName
 
 	current, err := u.currentVersion()
 	if err != nil {
-		slog.Error("failed to get current version", "error", err)
-		return
+		return out, fmt.Errorf("read installed version: %w", err)
 	}
+	out.current = current.String()
 
 	slog.Info("version check", "current", current.String(), "latest", latest.String())
 
 	if !latest.NewerThan(current) {
 		slog.Debug("already up to date")
-		return
+		return out, nil
 	}
 
 	slog.Info("new version available, updating", "current", current.String(), "latest", latest.String())
 
-	if err := u.applyUpdate(release); err != nil {
-		slog.Error("failed to apply update", "error", err)
-		return
+	replaced, err := u.applyUpdate(release)
+	if err != nil {
+		return out, fmt.Errorf("apply update %s: %w", release.TagName, err)
 	}
-
-	slog.Info("update applied successfully", "version", latest.String())
-	u.touchRestartRecord()
+	out.installed = release.TagName
+	out.updaterReplaced = replaced
+	return out, nil
 }
 
 // checkPinnedVersion installs the exact release specified by
@@ -249,22 +356,22 @@ func (u *Updater) checkOnce() {
 // default latest-following path, it does not compare versions — it
 // fetches the named release and applies it unconditionally when the
 // current install differs from the pin.
-func (u *Updater) checkPinnedVersion() {
+func (u *Updater) checkPinnedVersion() (checkOutcome, error) {
+	out := checkOutcome{latest: u.config.PinnedVersion}
 	pinned, err := ParseSemver(u.config.PinnedVersion)
 	if err != nil {
-		slog.Error("invalid pinned version", "version", u.config.PinnedVersion, "error", err)
-		return
+		return out, fmt.Errorf("invalid pinned version %q: %w", u.config.PinnedVersion, err)
 	}
 
 	current, err := u.currentVersion()
 	if err != nil {
-		slog.Error("failed to get current version", "error", err)
-		return
+		return out, fmt.Errorf("read installed version: %w", err)
 	}
+	out.current = current.String()
 
 	if current == pinned {
 		slog.Info("pinned version already installed", "version", pinned.String())
-		return
+		return out, nil
 	}
 
 	slog.Info("pinned version requested, installing",
@@ -274,17 +381,18 @@ func (u *Updater) checkPinnedVersion() {
 
 	release, err := u.fetchReleaseByTag(u.config.PinnedVersion)
 	if err != nil {
-		slog.Error("failed to fetch pinned release", "tag", u.config.PinnedVersion, "error", err)
-		return
+		return out, fmt.Errorf("fetch pinned release %s: %w", u.config.PinnedVersion, err)
 	}
 
-	if err := u.applyUpdate(release); err != nil {
-		slog.Error("failed to apply pinned update", "error", err)
-		return
+	replaced, err := u.applyUpdate(release)
+	if err != nil {
+		return out, fmt.Errorf("apply pinned update %s: %w", u.config.PinnedVersion, err)
 	}
 
 	slog.Info("pinned version installed", "version", pinned.String())
-	u.touchRestartRecord()
+	out.installed = release.TagName
+	out.updaterReplaced = replaced
+	return out, nil
 }
 
 func (u *Updater) fetchLatestRelease() (*GitHubRelease, error) {
@@ -316,15 +424,15 @@ func (u *Updater) fetchRelease(tag string) (*GitHubRelease, error) {
 		req.Header.Set("User-Agent", "pilot-updater/"+u.config.Version)
 	}
 
-	resp, err := u.client.Do(req)
+	// Sends GITHUB_TOKEN/GH_TOKEN when set (rate limit only; never required).
+	resp, err := doGitHubAPI(u.client, req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("GitHub API returned %d: %s", resp.StatusCode, string(body))
+		return nil, githubAPIError("GitHub API", resp)
 	}
 
 	var release GitHubRelease
@@ -352,7 +460,11 @@ func (u *Updater) currentVersion() (Semver, error) {
 	return ParseSemver(strings.TrimSpace(string(data)))
 }
 
-func (u *Updater) applyUpdate(release *GitHubRelease) error {
+// applyUpdate downloads, verifies and installs release into InstallDir. It
+// reports whether the pilot-updater binary itself was replaced. It does not
+// restart the daemon or exit: runCheck decides that, after recording the
+// outcome.
+func (u *Updater) applyUpdate(release *GitHubRelease) (updaterReplaced bool, err error) {
 	archiveName := fmt.Sprintf("pilot-%s-%s.tar.gz", runtime.GOOS, runtime.GOARCH)
 	var archiveURL, checksumsURL string
 
@@ -366,19 +478,19 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 	}
 
 	if archiveURL == "" {
-		return fmt.Errorf("no asset %q in release %s", archiveName, release.TagName)
+		return false, fmt.Errorf("no asset %q in release %s", archiveName, release.TagName)
 	}
 
 	tmpDir, err := os.MkdirTemp("", "pilot-update-*")
 	if err != nil {
-		return fmt.Errorf("create temp dir: %w", err)
+		return false, fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
 	// Download archive.
 	archivePath := filepath.Join(tmpDir, archiveName)
 	if err := u.downloadFile(archiveURL, archivePath); err != nil {
-		return fmt.Errorf("download archive: %w", err)
+		return false, fmt.Errorf("download archive: %w", err)
 	}
 
 	// Verify checksums. Both the asset's presence in the release AND
@@ -396,11 +508,11 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 	// before trusting the checksums file, closing the "matched fake
 	// binary + fake checksums" gap.
 	if checksumsURL == "" {
-		return fmt.Errorf("release %s has no checksums.txt asset; refusing to install unverified binary", release.TagName)
+		return false, fmt.Errorf("release %s has no checksums.txt asset; refusing to install unverified binary", release.TagName)
 	}
 	checksumsPath := filepath.Join(tmpDir, "checksums.txt")
 	if err := u.downloadFile(checksumsURL, checksumsPath); err != nil {
-		return fmt.Errorf("download checksums: %w", err)
+		return false, fmt.Errorf("download checksums: %w", err)
 	}
 
 	// Verify checksums.txt provenance via GitHub SLSA attestation.
@@ -413,29 +525,28 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 	// still-attested checksums.txt cannot be replayed under a new tag
 	// (validated rollback). Fails closed unless SkipAttestation is set.
 	if err := u.verifyChecksumsAttestation(release.TagName, checksumsPath); err != nil {
-		return fmt.Errorf("checksums attestation verification failed: %w", err)
+		return false, fmt.Errorf("checksums attestation verification failed: %w", err)
 	}
 
 	if err := VerifyChecksum(archivePath, archiveName, checksumsPath); err != nil {
-		return fmt.Errorf("checksum verification failed: %w", err)
+		return false, fmt.Errorf("checksum verification failed: %w", err)
 	}
 	slog.Info("checksum verified", "archive", archiveName)
 
 	// Extract to staging directory.
 	stagingDir := filepath.Join(tmpDir, "staging")
 	if err := os.MkdirAll(stagingDir, 0755); err != nil {
-		return fmt.Errorf("create staging dir: %w", err)
+		return false, fmt.Errorf("create staging dir: %w", err)
 	}
 	if err := extractTarGz(archivePath, stagingDir); err != nil {
-		return fmt.Errorf("extract archive: %w", err)
+		return false, fmt.Errorf("extract archive: %w", err)
 	}
 
 	entries, err := os.ReadDir(stagingDir)
 	if err != nil {
-		return fmt.Errorf("read staging dir: %w", err)
+		return false, fmt.Errorf("read staging dir: %w", err)
 	}
 
-	updaterReplaced := false
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -448,7 +559,7 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 		src := filepath.Join(stagingDir, entry.Name())
 		dst := filepath.Join(u.config.InstallDir, installName)
 		if err := replaceBinary(src, dst); err != nil {
-			return fmt.Errorf("replace %s: %w", installName, err)
+			return false, fmt.Errorf("replace %s: %w", installName, err)
 		}
 		slog.Info("replaced binary", "name", installName)
 		if installName == "pilot-updater" {
@@ -467,52 +578,7 @@ func (u *Updater) applyUpdate(release *GitHubRelease) error {
 		slog.Warn("failed to write version file", "error", err)
 	}
 
-	// If the updater binary itself was replaced, exit so launchd/systemd
-	// restarts the process with the new binary. On startup the new process
-	// runs recoverPendingRestart() which will handle the daemon restart.
-	// Explicitly clean up tmpDir first since defer won't run after os.Exit.
-	if updaterReplaced {
-		os.RemoveAll(tmpDir)
-		slog.Info("updater binary replaced — exiting for process manager to restart with new binary")
-		u.exitFn(0)
-	}
-
-	// Signal daemon to restart (SIGTERM for graceful shutdown).
-	u.signalDaemonRestart()
-
-	return nil
-}
-
-func (u *Updater) downloadFile(url, dst string) error {
-	resp, err := u.client.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
-	}
-
-	f, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// Read one byte past the cap so we can distinguish "exactly at the limit"
-	// from "exceeded the limit". A plain io.LimitReader(maxDownloadBytes) would
-	// silently truncate oversize archives — the SHA256 check would then fail
-	// with a confusing "checksum mismatch" instead of telling the operator
-	// the archive is too large.
-	n, err := io.Copy(f, io.LimitReader(resp.Body, maxDownloadBytes+1))
-	if err != nil {
-		return err
-	}
-	if n > maxDownloadBytes {
-		return fmt.Errorf("archive exceeds max download size %d bytes", maxDownloadBytes)
-	}
-	return nil
+	return updaterReplaced, nil
 }
 
 // VerifyChecksum checks the SHA256 of archivePath against the checksums file.
@@ -690,8 +756,9 @@ func (u *Updater) recoverPendingRestart() {
 	recordStat, err := os.Stat(restartRecord)
 	if err != nil || binStat.ModTime().After(recordStat.ModTime()) {
 		slog.Info("daemon binary updated since last restart, triggering restart")
-		u.signalDaemonRestart()
+		err := u.signalDaemonRestart()
 		u.touchRestartRecord()
+		u.recordRestart(err)
 	}
 }
 
@@ -720,59 +787,101 @@ func writeFileSync(path string, data []byte, perm os.FileMode) error {
 	return f.Close()
 }
 
-func (u *Updater) signalDaemonRestart() {
+// signalDaemonRestart restarts the daemon so it runs the newly installed
+// binaries. It returns an error when the daemon may still be running the old
+// binary; a daemon that is not running at all is not an error (its next
+// start uses the new binary).
+func (u *Updater) signalDaemonRestart() error {
 	if runtime.GOOS == "darwin" {
-		u.signalDaemonRestartDarwin()
-		return
+		return u.signalDaemonRestartDarwin()
 	}
-	u.signalDaemonRestartLinux()
+	return u.signalDaemonRestartLinux()
 }
 
-func (u *Updater) signalDaemonRestartDarwin() {
+// command runs an external command via the injectable hook.
+func (u *Updater) command(name string, args ...string) ([]byte, error) {
+	if u.runCmd != nil {
+		return u.runCmd(name, args...)
+	}
+	return runCommand(name, args...)
+}
+
+func (u *Updater) signalDaemonRestartDarwin() error {
 	// On macOS the daemon is managed by launchd. Use launchctl kickstart -k
 	// to kill the running instance and restart it immediately. The label
 	// matches the plist written by install.sh.
 	uid := os.Getuid()
 	label := "network.pilotprotocol.pilot-daemon"
 	target := fmt.Sprintf("gui/%d/%s", uid, label)
-	out, err := exec.Command("launchctl", "kickstart", "-k", target).CombinedOutput()
+	out, err := u.command("launchctl", "kickstart", "-k", target)
 	if err != nil {
+		output := strings.TrimSpace(string(out))
 		slog.Warn("launchctl kickstart failed — restart daemon manually",
-			"target", target, "err", err, "output", strings.TrimSpace(string(out)))
-		return
+			"target", target, "err", err, "output", output)
+		return fmt.Errorf("restart daemon (launchctl kickstart -k %s): %v %s", target, err, output)
 	}
 	slog.Info("daemon restarted via launchctl", "target", target)
+	return nil
 }
 
-func (u *Updater) signalDaemonRestartLinux() {
+func (u *Updater) signalDaemonRestartLinux() error {
 	// On Linux, find the daemon process via /proc/<pid>/exe and send SIGTERM.
-	// systemd Restart=on-failure will relaunch it automatically.
+	// systemd (Restart=always in the unit install.sh writes) relaunches it on
+	// the new binary.
 	daemonPath := filepath.Join(u.config.InstallDir, "pilot-daemon")
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		slog.Warn("cannot read /proc — restart daemon manually")
-		return
+	procRoot := u.procRoot
+	if procRoot == "" {
+		procRoot = "/proc"
 	}
+	pid, err := findProcessByExe(procRoot, daemonPath)
+	if err != nil {
+		slog.Warn("cannot read /proc — restart daemon manually", "error", err)
+		return fmt.Errorf("restart daemon: find process: %w", err)
+	}
+	if pid == 0 {
+		// Not running: its next start uses the new binary.
+		slog.Warn("daemon process not found — restart daemon manually if it is running", "path", daemonPath)
+		return nil
+	}
+	slog.Info("sending SIGTERM to daemon", "pid", pid)
+	kill := u.killFn
+	if kill == nil {
+		kill = syscall.Kill
+	}
+	if err := kill(pid, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("restart daemon: signal pid %d: %w", pid, err)
+	}
+	return nil
+}
 
+// findProcessByExe returns the pid of a process (other than this one) whose
+// executable is exePath, or 0 when there is none. After an update the old
+// binary has been renamed over, so the running daemon's /proc/<pid>/exe
+// reads "<exePath> (deleted)". That must match too, or the daemon is never
+// restarted onto the new version.
+func findProcessByExe(procRoot, exePath string) (int, error) {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return 0, err
+	}
+	self := os.Getpid()
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		exe, err := os.Readlink(filepath.Join("/proc", entry.Name(), "exe"))
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 || pid == self {
+			continue
+		}
+		exe, err := os.Readlink(filepath.Join(procRoot, entry.Name(), "exe"))
 		if err != nil {
 			continue
 		}
-		if exe == daemonPath {
-			pid := 0
-			fmt.Sscanf(entry.Name(), "%d", &pid)
-			if pid > 0 {
-				slog.Info("sending SIGTERM to daemon", "pid", pid)
-				syscall.Kill(pid, syscall.SIGTERM)
-				return
-			}
+		if exe == exePath || exe == exePath+" (deleted)" {
+			return pid, nil
 		}
 	}
-	slog.Warn("daemon process not found — restart daemon manually")
+	return 0, nil
 }
 
 // verifyChecksumsAttestation verifies the SLSA provenance of checksums.txt for

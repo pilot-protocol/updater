@@ -168,6 +168,9 @@ func TestRealVerify_EndToEnd_v1_12_5(t *testing.T) {
 	if !networkUp() {
 		t.Skip("network unreachable; skipping live attestation verification")
 	}
+	// Run with an empty PATH, as a service manager effectively does for
+	// user-installed tools: verification must not need gh or anything else.
+	t.Setenv("PATH", t.TempDir())
 
 	dir := t.TempDir()
 	cks := filepath.Join(dir, "checksums.txt")

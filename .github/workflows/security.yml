@@ -29,7 +29,7 @@ jobs:
 
   # SAST. Accepted rule exclusions (documented, minimal — never blanket):
   #   G104 — best-effort os.Remove/Close on error-cleanup paths.
-  #   G204 — exec of gh / launchctl with internally-built args (no user input).
+  #   G204 — exec of launchctl with internally-built args (no user input).
   #   G301 — staging/install dirs are 0755 (operator-readable install tree).
   #   G302 — extracted artifacts are executables and must be 0755.
   #   G304 — file paths derive from InstallDir / temp dir, inherent to an updater.
