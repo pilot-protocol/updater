@@ -2,7 +2,7 @@ module github.com/pilot-protocol/updater
 
 go 1.25.13
 
-require github.com/pilot-protocol/common v0.5.13
+require github.com/pilot-protocol/common v0.5.15
 
 require github.com/go-openapi/swag/pools v0.27.3 // indirect
 
