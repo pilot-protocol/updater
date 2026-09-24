@@ -3,12 +3,16 @@
 package updater
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -124,15 +128,50 @@ type Status struct {
 // returns an error satisfying errors.Is(err, fs.ErrNotExist), which callers
 // should read as "the updater has never recorded a check here".
 func ReadStatus(path string) (Status, error) {
+	s, _, err := readStatus(path)
+	return s, err
+}
+
+// statusFields is the set of JSON keys Status defines.
+var statusFields = func() map[string]bool {
+	fields := map[string]bool{}
+	t := reflect.TypeOf(Status{})
+	for i := 0; i < t.NumField(); i++ {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name == "" {
+			name = t.Field(i).Name
+		}
+		fields[name] = true
+	}
+	return fields
+}()
+
+// readStatus loads the status file and also returns the fields in it that
+// this version's Status does not define (written by a newer updater), so a
+// read-merge-write can keep them.
+func readStatus(path string) (Status, map[string]json.RawMessage, error) {
 	var s Status
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return s, err
+		return s, nil, err
 	}
 	if err := json.Unmarshal(data, &s); err != nil {
-		return Status{}, fmt.Errorf("parse %s: %w", path, err)
+		return Status{}, nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	return s, nil
+	var all map[string]json.RawMessage
+	if json.Unmarshal(data, &all) != nil {
+		return s, nil, nil
+	}
+	var extra map[string]json.RawMessage
+	for k, v := range all {
+		if !statusFields[k] {
+			if extra == nil {
+				extra = map[string]json.RawMessage{}
+			}
+			extra[k] = v
+		}
+	}
+	return s, extra, nil
 }
 
 // statusPath returns where this updater records its status, or "" when it
@@ -169,6 +208,10 @@ func (u *Updater) updateStatus(mutate func(*Status)) {
 
 	path := u.statusPath()
 	base := u.status
+	// Fields on disk that this version does not know, written by a newer
+	// updater sharing the file (e.g. a newer pilotctl than the updater
+	// service). They are written back unchanged.
+	var extra map[string]json.RawMessage
 	if path != "" {
 		wait := u.statusLockWait
 		if wait <= 0 {
@@ -176,8 +219,8 @@ func (u *Updater) updateStatus(mutate func(*Status)) {
 		}
 		unlock := lockStatusFile(path, wait)
 		defer unlock()
-		if onDisk, err := ReadStatus(path); err == nil {
-			base = onDisk
+		if onDisk, unknown, err := readStatus(path); err == nil {
+			base, extra = onDisk, unknown
 		}
 	}
 	mutate(&base)
@@ -188,7 +231,7 @@ func (u *Updater) updateStatus(mutate func(*Status)) {
 	if path == "" {
 		return
 	}
-	if err := writeStatusFile(path, base); err != nil {
+	if err := writeStatus(path, base, extra); err != nil {
 		slog.Warn("failed to write update status file", "path", path, "error", err)
 	}
 }
@@ -240,7 +283,47 @@ func lockStatusFile(path string, wait time.Duration) (unlock func()) {
 // writeStatusFile writes s to path atomically (temp file + rename in the same
 // directory) so a reader never sees a torn file.
 func writeStatusFile(path string, s Status) error {
+	return writeStatus(path, s, nil)
+}
+
+// marshalStatus renders s as indented JSON followed by the extra fields (ones
+// this version's Status does not define), in key order.
+func marshalStatus(s Status, extra map[string]json.RawMessage) ([]byte, error) {
 	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil || len(extra) == 0 {
+		return data, err
+	}
+	keys := make([]string, 0, len(extra))
+	for k := range extra {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	body := bytes.TrimRight(bytes.TrimSuffix(data, []byte("}")), "\n")
+	sep := ","
+	if bytes.Equal(bytes.TrimSpace(body), []byte("{")) {
+		sep = ""
+	}
+	var b bytes.Buffer
+	b.Write(body)
+	for _, k := range keys {
+		var v bytes.Buffer
+		if json.Indent(&v, extra[k], "  ", "  ") != nil {
+			continue
+		}
+		name, _ := json.Marshal(k)
+		b.WriteString(sep + "\n  ")
+		b.Write(name)
+		b.WriteString(": ")
+		b.Write(v.Bytes())
+		sep = ","
+	}
+	b.WriteString("\n}")
+	return b.Bytes(), nil
+}
+
+// writeStatus writes s, plus extra fields, to path atomically.
+func writeStatus(path string, s Status, extra map[string]json.RawMessage) error {
+	data, err := marshalStatus(s, extra)
 	if err != nil {
 		return err
 	}

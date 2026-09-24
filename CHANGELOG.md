@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the installed version, as Linux already did from `/proc`. Before, it
   stayed until the next release. The daemon is only asked while a
   `restart_error` is on record.
+- Writers of `update-state.json` keep the fields they do not define. The
+  file is shared by `pilotctl update` and the updater service, which can run
+  different updater versions. On a macOS runner the freshly restarted
+  updater service (updater v0.2.5, from v1.13.10) rewrote the file 40 ms
+  after `pilotctl update` and dropped `daemon_restarted_*` and
+  `updater_restarted_at`. From this version on, an older writer passes newer
+  fields through. v0.2.5 and earlier still drop them.
 
 ### Added
 

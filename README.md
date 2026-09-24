@@ -158,7 +158,9 @@ do. Each writer takes an advisory lock on `update-state.json.lock` and
 merges its fields into what is already there, so concurrent writers from
 different processes do not lose each other's changes. Writes are atomic
 (temp file + rename). A writer that cannot get the lock within 5 s writes
-anyway and logs a warning.
+anyway and logs a warning. A writer keeps the fields it does not define, so
+an older updater sharing the file (for example the updater service while a
+newer `pilotctl` runs) does not drop fields a newer one wrote.
 
 ```json
 {

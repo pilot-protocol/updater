@@ -3,6 +3,7 @@
 package updater
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -909,5 +910,69 @@ func TestRunCheck_DarwinClearsRestartErrorOnceDaemonIsCurrent(t *testing.T) {
 	fl.mu.Unlock()
 	if len(calls) != 0 {
 		t.Errorf("launchctl calls = %q, want none", calls)
+	}
+}
+
+// TestUpdateStatus_KeepsFieldsOfNewerWriters: pilotctl and the updater
+// service share update-state.json and can run different updater versions.
+// Seen on a macOS runner: the updater service of the release just installed
+// (an older updater) rewrote the file right after `pilotctl update` and
+// dropped daemon_restarted_* and updater_restarted_at, which it did not
+// know. A writer must keep fields it does not define, while its own fields
+// (including ones it clears) are written as it decides.
+func TestUpdateStatus_KeepsFieldsOfNewerWriters(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), StatusFileName)
+	onDisk := `{
+  "last_result": "updated",
+  "restart_error": "left running",
+  "future_restart": {"by": "launchd", "pids": [1, 2]},
+  "zz_flag": true
+}
+`
+	if err := os.WriteFile(path, []byte(onDisk), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	u := &Updater{config: Config{StatusPath: path, Version: "v0.2.6"}}
+	u.updateStatus(func(s *Status) { s.RestartError = ""; s.LoopPID = 42 })
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(data) {
+		t.Fatalf("status file is not valid JSON:\n%s", data)
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		t.Fatal(err)
+	}
+	if string(all["zz_flag"]) != "true" {
+		t.Errorf("zz_flag = %s, want kept", all["zz_flag"])
+	}
+	var fr struct {
+		By   string `json:"by"`
+		Pids []int  `json:"pids"`
+	}
+	if err := json.Unmarshal(all["future_restart"], &fr); err != nil || fr.By != "launchd" || len(fr.Pids) != 2 {
+		t.Errorf("future_restart = %s (%v), want kept", all["future_restart"], err)
+	}
+	if _, ok := all["restart_error"]; ok {
+		t.Error("restart_error kept; this writer cleared it")
+	}
+	st := mustReadStatus(t, path)
+	if st.LoopPID != 42 || st.LastResult != ResultUpdated || st.UpdaterVersion != "v0.2.6" {
+		t.Errorf("status = %+v", st)
+	}
+
+	// Without unknown fields the file is exactly the indented struct.
+	plain := Status{LastResult: ResultUpToDate}
+	got, err := marshalStatus(plain, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.MarshalIndent(plain, "", "  ")
+	if string(got) != string(want) {
+		t.Errorf("marshalStatus without extras = %s, want %s", got, want)
 	}
 }
