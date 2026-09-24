@@ -28,6 +28,11 @@ import (
 // developer Mac with Pilot installed, `launchctl kickstart -k
 // gui/<uid>/network.pilotprotocol.pilot-daemon` would restart the developer's
 // running daemon. Tests that care about the command use Updater.runCmd.
+//
+// For the same reason it replaces probeDaemonVersion, which would otherwise
+// connect to the developer's daemon on /tmp/pilot.sock. Tests that care about
+// the daemon's answer use Updater.probeFn (or call realProbeDaemonVersion on
+// a socket of their own).
 func TestMain(m *testing.M) {
 	verifyChecksumsAttestationFn = func(repo, tag, checksumsPath string) error {
 		return nil
@@ -35,8 +40,16 @@ func TestMain(m *testing.M) {
 	runCommand = func(name string, args ...string) ([]byte, error) {
 		return nil, nil
 	}
+	probeDaemonVersion = func(string) (string, bool) { return "", false }
 	os.Exit(m.Run())
 }
+
+// The real implementations, saved before TestMain replaces them. Package
+// variables are initialised before TestMain runs.
+var (
+	realRunCommand         = runCommand
+	realProbeDaemonVersion = probeDaemonVersion
+)
 
 func TestParseSemver(t *testing.T) {
 	t.Parallel()

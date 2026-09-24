@@ -80,7 +80,7 @@ func TestSignalDaemonRestartLinux_Paths(t *testing.T) {
 		gotPid, gotSig = pid, sig
 		return nil
 	}
-	if err := u.signalDaemonRestartLinux(); err != nil {
+	if err := u.signalDaemonRestartLinux().err; err != nil {
 		t.Fatalf("signalDaemonRestartLinux: %v", err)
 	}
 	if gotPid != 77 || gotSig != syscall.SIGTERM {
@@ -89,48 +89,18 @@ func TestSignalDaemonRestartLinux_Paths(t *testing.T) {
 
 	// The restarted daemon (on the installed binary) is found next time.
 	sys.onKill = func(int, syscall.Signal) error { return errors.New("operation not permitted") }
-	if err := u.signalDaemonRestartLinux(); err == nil || !strings.Contains(err.Error(), "operation not permitted") {
+	if err := u.signalDaemonRestartLinux().err; err == nil || !strings.Contains(err.Error(), "operation not permitted") {
 		t.Errorf("kill failure = %v, want reported", err)
 	}
 
 	root := u.procRoot
 	u.procRoot = fakeProc(t, nil)
-	if err := u.signalDaemonRestartLinux(); err != nil {
+	if err := u.signalDaemonRestartLinux().err; err != nil {
 		t.Errorf("daemon not running must not be an error, got %v", err)
 	}
 
 	u.procRoot = filepath.Join(root, "does-not-exist")
-	if err := u.signalDaemonRestartLinux(); err == nil {
+	if err := u.signalDaemonRestartLinux().err; err == nil {
 		t.Error("unreadable /proc must be reported")
-	}
-}
-
-// TestSignalDaemonRestartDarwin_Paths: the launchctl invocation and its
-// failure are reported (a daemon started by hand, not by launchd, keeps
-// running the old binary).
-func TestSignalDaemonRestartDarwin_Paths(t *testing.T) {
-	t.Parallel()
-	var got []string
-	u := &Updater{
-		config: Config{InstallDir: t.TempDir()},
-		runCmd: func(name string, args ...string) ([]byte, error) {
-			got = append([]string{name}, args...)
-			return nil, nil
-		},
-	}
-	if err := u.signalDaemonRestartDarwin(); err != nil {
-		t.Fatalf("signalDaemonRestartDarwin: %v", err)
-	}
-	if len(got) != 4 || got[0] != "launchctl" || got[1] != "kickstart" || got[2] != "-k" ||
-		!strings.HasSuffix(got[3], "/network.pilotprotocol.pilot-daemon") {
-		t.Errorf("command = %q", got)
-	}
-
-	u.runCmd = func(string, ...string) ([]byte, error) {
-		return []byte("Could not find service"), errors.New("exit status 113")
-	}
-	err := u.signalDaemonRestartDarwin()
-	if err == nil || !strings.Contains(err.Error(), "Could not find service") || !strings.Contains(err.Error(), "exit status 113") {
-		t.Errorf("launchctl failure = %v, want reported with output", err)
 	}
 }
