@@ -153,7 +153,7 @@ func TestSystemdE2E_RestartAlways(t *testing.T) {
 		t.Fatalf("after replace, exe = %q", got)
 	}
 
-	if err := u.signalDaemonRestart(); err != nil {
+	if err := u.signalDaemonRestart().err; err != nil {
 		t.Fatalf("signalDaemonRestart: %v", err)
 	}
 	newPid := mainPID(t, unit)
@@ -177,7 +177,7 @@ func TestSystemdE2E_RestartOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := u.signalDaemonRestart()
+	err := u.signalDaemonRestart().err
 	if err == nil || !strings.Contains(err.Error(), "Restart=on-failure") {
 		t.Fatalf("signalDaemonRestart = %v, want the Restart=on-failure error", err)
 	}
@@ -215,7 +215,7 @@ func TestSystemdE2E_Unsupervised(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := u.signalDaemonRestart()
+	err := u.signalDaemonRestart().err
 	if err == nil || !strings.Contains(err.Error(), "pilotctl daemon stop && pilotctl daemon start") {
 		t.Fatalf("signalDaemonRestart = %v, want the unsupervised error", err)
 	}

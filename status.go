@@ -82,13 +82,34 @@ type Status struct {
 	LastUpdateVersion string    `json:"last_update_version,omitempty"`
 	// RestartError is set when new binaries were installed but the daemon
 	// is not running them: it was left on the old version, or it was
-	// stopped and did not come back. It says how to restart it. On Linux the
-	// updater stops the daemon only when systemd will start it again, so a
-	// daemon without such a service (e.g. `pilotctl daemon start` in a
-	// container) is left running and reported here. Cleared by the next
-	// successful restart and, on Linux, by the next check that finds the
-	// daemon running the installed binary.
+	// stopped and did not come back. It says how to restart it. The updater
+	// stops the daemon only when a service manager will start it again: a
+	// systemd service on Linux, the launchd job on macOS. A daemon without
+	// one (e.g. `pilotctl daemon start` in a container) is left running and
+	// reported here. Cleared by the next successful restart and by the next
+	// check that finds the daemon running the installed release.
 	RestartError string `json:"restart_error,omitempty"`
+	// DaemonRestartedAt is when the updater last restarted the daemon onto
+	// installed binaries and saw it come back: a new process on the
+	// installed binary under systemd (Linux), or a new launchd process that
+	// answered over IPC with the installed version (macOS).
+	DaemonRestartedAt time.Time `json:"daemon_restarted_at,omitzero"`
+	// DaemonRestartedBy names the service that restarted it, e.g.
+	// "launchd gui/501/network.pilotprotocol.pilot-daemon" or
+	// "systemd pilot-daemon.service".
+	DaemonRestartedBy string `json:"daemon_restarted_by,omitempty"`
+	// DaemonRestartedVersion is the version the daemon reported over IPC
+	// after that restart (macOS; empty on Linux).
+	DaemonRestartedVersion string `json:"daemon_restarted_version,omitempty"`
+
+	// UpdaterRestartError is set when a one-shot update (RunOnce, e.g.
+	// `pilotctl update`) replaced pilot-updater but could not move the
+	// running updater service (the macOS launchd job) onto it. Cleared by the
+	// next successful restart.
+	UpdaterRestartError string `json:"updater_restart_error,omitempty"`
+	// UpdaterRestartedAt is when a one-shot update last restarted the
+	// updater service onto a new pilot-updater binary.
+	UpdaterRestartedAt time.Time `json:"updater_restarted_at,omitzero"`
 
 	// LoopPID and LoopStartedAt identify the long-running updater process
 	// (the service started via Start). Absent when no loop ever ran.
@@ -261,12 +282,15 @@ type checkOutcome struct {
 	// updaterReplaced reports that the pilot-updater binary itself was
 	// swapped, so the running updater process is now stale.
 	updaterReplaced bool
-	// restartErr is the error from restarting the daemon onto the new
-	// binaries, if that failed.
-	restartErr error
+	// restart is the daemon restart this check made (nil = none: nothing
+	// was installed, or the loop left it to its successor process).
+	restart *restartOutcome
+	// updaterRestart is the updater service restart this check made (nil =
+	// none).
+	updaterRestart *restartOutcome
 	// daemonCurrent reports that, with nothing installed by this check, the
-	// daemon was found running the installed binary (Linux only), so an
-	// earlier restart_error no longer applies.
+	// daemon was found running the installed release, so an earlier
+	// restart_error no longer applies.
 	daemonCurrent bool
 }
 
@@ -305,25 +329,58 @@ func (u *Updater) recordCheck(trigger string, out checkOutcome, checkErr error) 
 		s.LastResult = ResultUpdated
 		s.LastUpdateAt = now
 		s.LastUpdateVersion = out.installed
-		if out.restartErr != nil {
-			s.RestartError = out.restartErr.Error()
-		} else if !out.updaterReplaced {
-			// The daemon was restarted onto the new binaries. (When the
-			// updater replaced itself, the restart happens in the new
-			// process — see recoverPendingRestart — which records it.)
-			s.RestartError = ""
+		// When the loop replaced its own binary it exits without restarting
+		// the daemon: the new process does that (recoverPendingRestart) and
+		// records it.
+		if out.restart != nil {
+			applyDaemonRestart(s, *out.restart, now)
+		}
+		if out.updaterRestart != nil {
+			applyUpdaterRestart(s, *out.updaterRestart, now)
 		}
 	})
 }
 
+// applyDaemonRestart records a daemon restart attempt in s.
+func applyDaemonRestart(s *Status, r restartOutcome, now time.Time) {
+	if r.err != nil {
+		s.RestartError = r.err.Error()
+		return
+	}
+	s.RestartError = ""
+	if r.restarted {
+		s.DaemonRestartedAt = now
+		s.DaemonRestartedBy = r.by
+		s.DaemonRestartedVersion = r.version
+	}
+}
+
+// applyUpdaterRestart records an updater service restart attempt in s.
+func applyUpdaterRestart(s *Status, r restartOutcome, now time.Time) {
+	if r.err != nil {
+		s.UpdaterRestartError = r.err.Error()
+		return
+	}
+	s.UpdaterRestartError = ""
+	if r.restarted {
+		s.UpdaterRestartedAt = now
+	}
+}
+
 // recordRestart records the outcome of a daemon restart made outside a
 // check (recoverPendingRestart).
-func (u *Updater) recordRestart(err error) {
-	u.updateStatus(func(s *Status) {
-		if err != nil {
-			s.RestartError = err.Error()
-		} else {
-			s.RestartError = ""
+func (u *Updater) recordRestart(r restartOutcome) {
+	now := time.Now().UTC()
+	u.updateStatus(func(s *Status) { applyDaemonRestart(s, r, now) })
+}
+
+// recordedRestartError is the restart_error currently on record: in the
+// status file when there is one, else in this Updater's last status.
+func (u *Updater) recordedRestartError() string {
+	if path := u.statusPath(); path != "" {
+		if s, err := ReadStatus(path); err == nil {
+			return s.RestartError
 		}
-	})
+	}
+	return u.LastStatus().RestartError
 }

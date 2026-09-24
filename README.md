@@ -48,23 +48,33 @@ if st.RestartError != "" {
 
 `RunOnce` returns the check's error. It never exits the calling process. If
 the release replaced `pilot-updater`, the daemon is still restarted onto the
-new binaries. A running updater service switches to its new binary the next
-time its service manager restarts it.
+new binaries. On macOS the updater service (launchd job
+`network.pilotprotocol.pilot-updater`) is then restarted onto the new
+`pilot-updater` as well. On Linux a running updater service switches to its
+new binary the next time systemd restarts it.
 
 A `RunOnce` caller writes the status file only when it sets `StatusPath` (or
-`StatePath`); otherwise only `LastStatus()` has the result. **`pilotctl
-update` does not do this yet.** As of web4 `main` on 2026-09-24,
-`cmd/pilotctl/updates.go` sets neither path and ignores the error `RunOnce`
-returns. So manual updates are not recorded in `update-state.json`, and a
-failed `pilotctl update` still prints success and exits 0. That stays true
-until pilotctl passes `StatusPath: ~/.pilot/update-state.json` and checks the
-error, which needs a web4 change after this version is released.
+`StatePath`); otherwise only `LastStatus()` has the result. `pilotctl update`
+(web4 `cmd/pilotctl/updates.go`, since updater v0.2.5) passes
+`StatusPath: ~/.pilot/update-state.json` and exits non-zero when `RunOnce`
+returns an error.
 
 ### Restarting the daemon
 
-After installing new binaries the updater restarts the daemon onto them:
+After installing new binaries the updater restarts the daemon onto them, but
+only when a service manager will start it again:
 
-- **macOS:** `launchctl kickstart -k gui/<uid>/network.pilotprotocol.pilot-daemon`.
+- **macOS:** `launchctl kickstart -k gui/<uid>/network.pilotprotocol.pilot-daemon`,
+  but only when that launchd job runs the daemon. The updater reads the job
+  with `launchctl print` and kickstarts it only when it is running and its
+  program is the `pilot-daemon` that was just replaced. launchd sends the
+  daemon SIGTERM (its graceful shutdown stops the apps it runs) and starts
+  the job again on the new binary, whatever its `KeepAlive` policy. The
+  updater then waits up to 60 s for launchd to run a new process and for that
+  process to answer over IPC (`info`, on the job's `-socket`) with the
+  installed version. The old `com.vulturelabs.pilot-daemon` label and the
+  `user/<uid>` domain are found too; under `sudo` the invoking user's
+  (`SUDO_UID`) domain is used.
 - **Linux:** SIGTERM, but only when systemd will start the daemon again. The
   daemon must run as the main program (`ExecStart=`) of a system service whose
   unit restarts it after a clean exit. pilot-daemon exits 0 on SIGTERM, so
@@ -72,6 +82,28 @@ After installing new binaries the updater restarts the daemon onto them:
   from `/proc/<pid>/cgroup` and reads the unit file and its drop-ins. It does
   not run `systemctl`. After the SIGTERM it waits up to 30 s for a new daemon
   process on the new binary.
+
+On macOS the daemon is left running the old version, with `restart_error`
+saying how to restart it, when:
+
+- no launchd job runs it: it was started by hand (`pilot-daemon ...`) while
+  the job was not loaded, or the job is loaded but runs no process. The
+  updater tells this from a daemon answering on the socket with an older
+  version. When no daemon answers, it is not running and its next start uses
+  the new binary, which is not an error;
+- the job starts another `pilot-daemon` (a second installation), so a
+  restart would not run the new release.
+
+It is also reported when `launchctl kickstart` fails, when launchd does not
+start the job again, or when the new daemon does not answer with the
+installed version within 60 s.
+
+When a one-shot `RunOnce` (`pilotctl update`) replaced `pilot-updater`, it
+restarts the updater job `network.pilotprotocol.pilot-updater` the same way,
+after the daemon and only when the job runs the replaced binary. It never
+restarts itself: the loop (`Start`) exits instead, and launchd starts it
+again (`KeepAlive`). The result goes to `updater_restart_error` /
+`updater_restarted_at`.
 
 On Linux the daemon is left running the old version, with `restart_error`
 saying how to restart it, when:
@@ -121,8 +153,8 @@ set, it goes next to the control file. For a standard install that is
 set, nothing is written.
 
 The long-running updater and any one-shot `RunOnce` caller configured with
-the same path share the file. `pilotctl update` does not pass one yet (see
-above). Each writer takes an advisory lock on `update-state.json.lock` and
+the same path share the file, as the updater service and `pilotctl update`
+do. Each writer takes an advisory lock on `update-state.json.lock` and
 merges its fields into what is already there, so concurrent writers from
 different processes do not lose each other's changes. Writes are atomic
 (temp file + rename). A writer that cannot get the lock within 5 s writes
@@ -142,6 +174,9 @@ anyway and logs a warning.
   "latest_version": "v1.13.10",
   "last_update_at": "2026-09-01T12:35:40Z",
   "last_update_version": "v1.13.9",
+  "daemon_restarted_at": "2026-09-01T12:35:47Z",
+  "daemon_restarted_by": "launchd gui/501/network.pilotprotocol.pilot-daemon",
+  "daemon_restarted_version": "v1.13.9",
   "loop_pid": 812,
   "loop_started_at": "2026-09-20T08:11:02Z",
   "next_check_at": "2026-09-24T11:00:12Z"
@@ -155,7 +190,9 @@ anyway and logs a warning.
 | `consecutive_failures` | Failed checks since the last success. |
 | `last_success_at` | The last check that completed without error. |
 | `current_version` / `latest_version` | The installed release, and the release it was compared against (the pin, when pinned). |
-| `restart_error` | New binaries were installed but the daemon is not running them. Either it was left on the old version because stopping it would have left it down (see [Restarting the daemon](#restarting-the-daemon)) or the restart failed, or it was stopped and did not come back. Says how to restart it. Cleared by the next successful restart, and on Linux by the next check that finds the daemon running the installed binary. |
+| `restart_error` | New binaries were installed but the daemon is not running them. Either it was left on the old version because stopping it would have left it down (see [Restarting the daemon](#restarting-the-daemon)) or the restart failed, or it was stopped and did not come back. Says how to restart it. Cleared by the next successful restart, and by the next check that finds the daemon running the installed release (Linux: from `/proc`; macOS: the daemon's IPC `info` version). |
+| `daemon_restarted_at`, `daemon_restarted_by`, `daemon_restarted_version` | The last restart the updater made that brought the daemon back on new binaries, the service manager and job that did it, and (macOS) the version the daemon then reported over IPC. |
+| `updater_restart_error`, `updater_restarted_at` | macOS only: a one-shot update replaced `pilot-updater` and could not (error) or did (time) restart the updater service's launchd job onto it. |
 | `loop_pid`, `loop_started_at` | The long-running updater process. |
 | `next_check_at` | When the loop wakes next. It is updated even while auto-update is disabled, so it doubles as a heartbeat. |
 
@@ -210,9 +247,11 @@ The SHA-256 match against the attested `checksums.txt` still gates every install
 
 The updater never runs `gh` or any other external tool. It checks the SLSA
 provenance of `checksums.txt` in-process with sigstore-go
-(`attestation.go`). The only command it runs is `launchctl kickstart`, which
-restarts the daemon under launchd on macOS. On Linux it reads `/proc` and the
-systemd unit files directly instead of running `systemctl`.
+(`attestation.go`). The only command it runs is `launchctl` (`print` and
+`kickstart`), which reads and restarts the daemon and updater jobs under
+launchd on macOS. It asks the daemon for its version over its IPC socket
+directly. On Linux it reads `/proc` and the systemd unit files directly
+instead of running `systemctl`.
 `TestNoExternalToolDependency` fails the build if another exec is added.
 
 ### Nodes stuck on v1.12.2–v1.13.4 (updater v0.2.3)
@@ -253,6 +292,7 @@ because that switches off provenance checks.
 |---|---|
 | `updater.go` | `Updater`: check loop, `RunOnce`, release polling, install, daemon restart. |
 | `supervisor.go` | Linux restart safety: finds the daemon's systemd service and checks its restart policy before any SIGTERM. |
+| `launchd.go` | macOS restart: finds the daemon and updater launchd jobs (`launchctl print`), kickstarts them and confirms the daemon's version over IPC. |
 | `download.go` | Resumable asset downloads with idle and total-duration limits. |
 | `github.go` | GitHub API calls: optional `GITHUB_TOKEN`, rate-limit errors. |
 | `attestation.go` | In-process SLSA provenance verification of `checksums.txt` (sigstore-go). |
