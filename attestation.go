@@ -14,7 +14,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 
 	sgbundle "github.com/sigstore/sigstore-go/pkg/bundle"
 	"github.com/sigstore/sigstore-go/pkg/root"
@@ -47,8 +46,9 @@ var (
 )
 
 // githubToken returns a GitHub API token from the environment, if any. Optional:
-// used only to raise the API rate limit (see fetchAttestations). GITHUB_TOKEN is
-// the conventional name; GH_TOKEN is gh's alias.
+// used only to raise the API rate limit (see doGitHubAPI) for the releases and
+// attestations endpoints. GITHUB_TOKEN is the conventional name; GH_TOKEN is
+// gh's alias. The updater never runs the gh CLI itself.
 func githubToken() string {
 	for _, k := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
 		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
@@ -89,8 +89,8 @@ func sha256Hex(path string) (string, error) {
 }
 
 // fetchAttestations retrieves the SLSA attestation bundles GitHub holds for the
-// given repository + artifact digest. Unauthenticated: the endpoint is public
-// for public repositories and requires no gh CLI or token.
+// given repository + artifact digest. The endpoint is public for public
+// repositories and requires no gh CLI or token.
 func fetchAttestations(client *http.Client, repo, digestHex string) ([]json.RawMessage, error) {
 	url := fmt.Sprintf("%s/repos/%s/attestations/sha256:%s", attestationAPIBase, repo, digestHex)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -99,23 +99,19 @@ func fetchAttestations(client *http.Client, repo, digestHex string) ([]json.RawM
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	// No token is required — the endpoint is public for public repositories.
-	// If one is present in the environment we send it purely to lift the
-	// 60-req/hr unauthenticated rate limit (5000/hr authenticated), so a busy
-	// fleet does not intermittently fail closed on a 403 rate-limit. Absence of
-	// a token never changes correctness, only the rate ceiling.
-	if tok := githubToken(); tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
 
-	resp, err := client.Do(req)
+	// No token is required. If GITHUB_TOKEN/GH_TOKEN is set, doGitHubAPI
+	// sends it purely to lift the 60-req/hr unauthenticated rate limit
+	// (5000/hr authenticated), so a busy fleet does not intermittently fail
+	// closed on a 403 rate-limit. A token never changes correctness, only the
+	// rate ceiling.
+	resp, err := doGitHubAPI(client, req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch attestations: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("GitHub attestations API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, githubAPIError("GitHub attestations API", resp)
 	}
 
 	var parsed githubAttestationsResponse
@@ -206,7 +202,7 @@ func realVerifyChecksumsAttestationFn(repo, tag, checksumsPath string) error {
 		verify.WithCertificateIdentity(certID),
 	)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: apiTimeout, Transport: newTransport()}
 	rawBundles, err := fetchAttestations(client, repo, digestHex)
 	if err != nil {
 		return err

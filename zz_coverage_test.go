@@ -343,7 +343,7 @@ func TestApplyUpdate_ArchiveAssetMissing(t *testing.T) {
 		client: http.DefaultClient,
 		stopCh: make(chan struct{}),
 	}
-	err := u.applyUpdate(&GitHubRelease{
+	_, err := u.applyUpdate(&GitHubRelease{
 		TagName: "v1.0.0",
 		Assets:  []GitHubAsset{{Name: "checksums.txt", BrowserDownloadURL: "http://x"}},
 	})
@@ -367,7 +367,7 @@ func TestApplyUpdate_ArchiveDownloadFails(t *testing.T) {
 		client: srv.Client(),
 		stopCh: make(chan struct{}),
 	}
-	err := u.applyUpdate(&GitHubRelease{
+	_, err := u.applyUpdate(&GitHubRelease{
 		TagName: "v1.0.0",
 		Assets: []GitHubAsset{
 			{Name: archiveName, BrowserDownloadURL: srv.URL + "/archive"},
@@ -405,7 +405,7 @@ func TestApplyUpdate_ChecksumMismatch(t *testing.T) {
 		client: srv.Client(),
 		stopCh: make(chan struct{}),
 	}
-	err := u.applyUpdate(&GitHubRelease{
+	_, err := u.applyUpdate(&GitHubRelease{
 		TagName: "v1.0.0",
 		Assets: []GitHubAsset{
 			{Name: archiveName, BrowserDownloadURL: srv.URL + "/dl/" + archiveName},
@@ -444,7 +444,7 @@ func TestApplyUpdate_CorruptArchiveExtractFails(t *testing.T) {
 		client: srv.Client(),
 		stopCh: make(chan struct{}),
 	}
-	err := u.applyUpdate(&GitHubRelease{
+	_, err := u.applyUpdate(&GitHubRelease{
 		TagName: "v1.0.0",
 		Assets: []GitHubAsset{
 			{Name: archiveName, BrowserDownloadURL: srv.URL + "/dl/" + archiveName},

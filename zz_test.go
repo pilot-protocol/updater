@@ -23,9 +23,17 @@ import (
 // production fail-closed behaviour restore realVerifyChecksumsAttestationFn
 // explicitly (see TestVerifyChecksumsAttestation_* and
 // TestApplyUpdate_SkipAttestationStillRequiresChecksum).
+//
+// It also replaces runCommand so no test can run the real launchctl: on a
+// developer Mac with Pilot installed, `launchctl kickstart -k
+// gui/<uid>/network.pilotprotocol.pilot-daemon` would restart the developer's
+// running daemon. Tests that care about the command use Updater.runCmd.
 func TestMain(m *testing.M) {
 	verifyChecksumsAttestationFn = func(repo, tag, checksumsPath string) error {
 		return nil
+	}
+	runCommand = func(name string, args ...string) ([]byte, error) {
+		return nil, nil
 	}
 	os.Exit(m.Run())
 }
@@ -420,13 +428,18 @@ func TestApplyUpdate_SkipsServerBinaries(t *testing.T) {
 		},
 	}
 
-	if err := u.applyUpdate(release); err != nil {
+	updaterReplaced, err := u.applyUpdate(release)
+	if err != nil {
 		t.Fatalf("applyUpdate: %v", err)
 	}
 
-	// updater binary replaced → self-exit should have been triggered.
-	if !exitCalled {
-		t.Error("expected exitFn to be called after updater binary replacement")
+	// applyUpdate reports the self-replacement; the exit decision belongs
+	// to runCheck (loop exits, RunOnce does not), so applyUpdate never exits.
+	if !updaterReplaced {
+		t.Error("expected applyUpdate to report the updater binary was replaced")
+	}
+	if exitCalled {
+		t.Error("applyUpdate must not exit; runCheck decides")
 	}
 
 	// Client binaries should be updated using installed names (pilot- prefix).
