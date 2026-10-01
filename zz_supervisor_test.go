@@ -238,7 +238,7 @@ func TestSignalDaemonRestartLinux_UnsupervisedDaemonIsLeftRunning(t *testing.T) 
 			u := &Updater{config: Config{InstallDir: installDir}, goos: "linux"}
 			fs.attach(u)
 
-			err := u.signalDaemonRestart()
+			err := u.signalDaemonRestart().err
 			if err == nil {
 				t.Fatal("signalDaemonRestart = nil; an unsupervised daemon must be reported, not stopped")
 			}
@@ -344,7 +344,7 @@ func TestSignalDaemonRestartLinux_RestartPolicy(t *testing.T) {
 			u := &Updater{config: Config{InstallDir: installDir}, goos: "linux"}
 			fs.attach(u)
 
-			err := u.signalDaemonRestart()
+			err := u.signalDaemonRestart().err
 			if tc.signal {
 				if err != nil {
 					t.Fatalf("signalDaemonRestart: %v", err)
@@ -369,7 +369,7 @@ func TestSignalDaemonRestartLinux_RestartPolicy(t *testing.T) {
 func TestSignalDaemonRestartLinux_OnFailureMessage(t *testing.T) {
 	t.Parallel()
 	u, fs := supervisedLinuxUpdater(t, "on-failure")
-	err := u.signalDaemonRestart()
+	err := u.signalDaemonRestart().err
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -395,7 +395,7 @@ func TestSignalDaemonRestartLinux_ReportsDaemonThatDoesNotComeBack(t *testing.T)
 	fs.restarts = false
 	u.restartWait = 50 * time.Millisecond
 
-	err := u.signalDaemonRestart()
+	err := u.signalDaemonRestart().err
 	if err == nil {
 		t.Fatal("signalDaemonRestart = nil although the daemon never came back")
 	}
@@ -426,7 +426,7 @@ func TestSignalDaemonRestartLinux_WaitsForNewDaemon(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := u.signalDaemonRestart(); err != nil {
+	if err := u.signalDaemonRestart().err; err != nil {
 		t.Fatalf("signalDaemonRestart: %v", err)
 	}
 	if time.Since(start) < fs.delay {
@@ -451,7 +451,7 @@ func TestSignalDaemonRestartLinux_StopAbortsWait(t *testing.T) {
 	close(u.stopCh)
 
 	done := make(chan error, 1)
-	go func() { done <- u.signalDaemonRestart() }()
+	go func() { done <- u.signalDaemonRestart().err }()
 	select {
 	case err := <-done:
 		if err == nil || !strings.Contains(err.Error(), "updater stopped") {
@@ -613,7 +613,9 @@ func TestRunCheck_ClearsRestartErrorOnceDaemonIsCurrent(t *testing.T) {
 		t.Errorf("restart_error = %q, want cleared once the daemon runs the installed binary", st.RestartError)
 	}
 
-	// macOS has no /proc to check, so the error is kept there.
+	// macOS has no /proc: it asks the daemon over IPC instead (see
+	// TestRunCheck_DarwinClearsRestartErrorOnceDaemonIsCurrent). With no
+	// daemon answering, the error is kept.
 	if err := writeStatusFile(statusPath, Status{RestartError: restartErr}); err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +624,7 @@ func TestRunCheck_ClearsRestartErrorOnceDaemonIsCurrent(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if st := mustReadStatus(t, statusPath); st.RestartError != restartErr {
-		t.Errorf("darwin: restart_error = %q, want kept (no /proc to check)", st.RestartError)
+		t.Errorf("darwin: restart_error = %q, want kept while no daemon answers", st.RestartError)
 	}
 }
 

@@ -138,11 +138,15 @@ func scanDaemonProcs(procRoot, exePath string) (current, replaced []int, err err
 }
 
 // daemonOnInstalledBinary reports whether the daemon is known to be running
-// the installed binary: a process runs daemonPath itself and none still runs
-// a replaced copy. Only Linux can tell (from /proc); elsewhere it returns
-// false.
+// the installed release. On Linux a process runs daemonPath itself and none
+// still runs a replaced copy (from /proc). On macOS the daemon answers over
+// IPC with the installed version. Elsewhere it returns false.
 func (u *Updater) daemonOnInstalledBinary() bool {
-	if u.targetOS() != "linux" {
+	switch u.targetOS() {
+	case "linux":
+	case "darwin":
+		return u.daemonOnInstalledVersionDarwin()
+	default:
 		return false
 	}
 	daemonPath := filepath.Join(u.config.InstallDir, "pilot-daemon")

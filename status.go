@@ -3,12 +3,16 @@
 package updater
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -82,13 +86,34 @@ type Status struct {
 	LastUpdateVersion string    `json:"last_update_version,omitempty"`
 	// RestartError is set when new binaries were installed but the daemon
 	// is not running them: it was left on the old version, or it was
-	// stopped and did not come back. It says how to restart it. On Linux the
-	// updater stops the daemon only when systemd will start it again, so a
-	// daemon without such a service (e.g. `pilotctl daemon start` in a
-	// container) is left running and reported here. Cleared by the next
-	// successful restart and, on Linux, by the next check that finds the
-	// daemon running the installed binary.
+	// stopped and did not come back. It says how to restart it. The updater
+	// stops the daemon only when a service manager will start it again: a
+	// systemd service on Linux, the launchd job on macOS. A daemon without
+	// one (e.g. `pilotctl daemon start` in a container) is left running and
+	// reported here. Cleared by the next successful restart and by the next
+	// check that finds the daemon running the installed release.
 	RestartError string `json:"restart_error,omitempty"`
+	// DaemonRestartedAt is when the updater last restarted the daemon onto
+	// installed binaries and saw it come back: a new process on the
+	// installed binary under systemd (Linux), or a new launchd process that
+	// answered over IPC with the installed version (macOS).
+	DaemonRestartedAt time.Time `json:"daemon_restarted_at,omitzero"`
+	// DaemonRestartedBy names the service that restarted it, e.g.
+	// "launchd gui/501/network.pilotprotocol.pilot-daemon" or
+	// "systemd pilot-daemon.service".
+	DaemonRestartedBy string `json:"daemon_restarted_by,omitempty"`
+	// DaemonRestartedVersion is the version the daemon reported over IPC
+	// after that restart (macOS; empty on Linux).
+	DaemonRestartedVersion string `json:"daemon_restarted_version,omitempty"`
+
+	// UpdaterRestartError is set when a one-shot update (RunOnce, e.g.
+	// `pilotctl update`) replaced pilot-updater but could not move the
+	// running updater service (the macOS launchd job) onto it. Cleared by the
+	// next successful restart.
+	UpdaterRestartError string `json:"updater_restart_error,omitempty"`
+	// UpdaterRestartedAt is when a one-shot update last restarted the
+	// updater service onto a new pilot-updater binary.
+	UpdaterRestartedAt time.Time `json:"updater_restarted_at,omitzero"`
 
 	// LoopPID and LoopStartedAt identify the long-running updater process
 	// (the service started via Start). Absent when no loop ever ran.
@@ -103,15 +128,50 @@ type Status struct {
 // returns an error satisfying errors.Is(err, fs.ErrNotExist), which callers
 // should read as "the updater has never recorded a check here".
 func ReadStatus(path string) (Status, error) {
+	s, _, err := readStatus(path)
+	return s, err
+}
+
+// statusFields is the set of JSON keys Status defines.
+var statusFields = func() map[string]bool {
+	fields := map[string]bool{}
+	t := reflect.TypeOf(Status{})
+	for i := 0; i < t.NumField(); i++ {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		if name == "" {
+			name = t.Field(i).Name
+		}
+		fields[name] = true
+	}
+	return fields
+}()
+
+// readStatus loads the status file and also returns the fields in it that
+// this version's Status does not define (written by a newer updater), so a
+// read-merge-write can keep them.
+func readStatus(path string) (Status, map[string]json.RawMessage, error) {
 	var s Status
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return s, err
+		return s, nil, err
 	}
 	if err := json.Unmarshal(data, &s); err != nil {
-		return Status{}, fmt.Errorf("parse %s: %w", path, err)
+		return Status{}, nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	return s, nil
+	var all map[string]json.RawMessage
+	if json.Unmarshal(data, &all) != nil {
+		return s, nil, nil
+	}
+	var extra map[string]json.RawMessage
+	for k, v := range all {
+		if !statusFields[k] {
+			if extra == nil {
+				extra = map[string]json.RawMessage{}
+			}
+			extra[k] = v
+		}
+	}
+	return s, extra, nil
 }
 
 // statusPath returns where this updater records its status, or "" when it
@@ -148,6 +208,10 @@ func (u *Updater) updateStatus(mutate func(*Status)) {
 
 	path := u.statusPath()
 	base := u.status
+	// Fields on disk that this version does not know, written by a newer
+	// updater sharing the file (e.g. a newer pilotctl than the updater
+	// service). They are written back unchanged.
+	var extra map[string]json.RawMessage
 	if path != "" {
 		wait := u.statusLockWait
 		if wait <= 0 {
@@ -155,8 +219,8 @@ func (u *Updater) updateStatus(mutate func(*Status)) {
 		}
 		unlock := lockStatusFile(path, wait)
 		defer unlock()
-		if onDisk, err := ReadStatus(path); err == nil {
-			base = onDisk
+		if onDisk, unknown, err := readStatus(path); err == nil {
+			base, extra = onDisk, unknown
 		}
 	}
 	mutate(&base)
@@ -167,7 +231,7 @@ func (u *Updater) updateStatus(mutate func(*Status)) {
 	if path == "" {
 		return
 	}
-	if err := writeStatusFile(path, base); err != nil {
+	if err := writeStatus(path, base, extra); err != nil {
 		slog.Warn("failed to write update status file", "path", path, "error", err)
 	}
 }
@@ -219,7 +283,47 @@ func lockStatusFile(path string, wait time.Duration) (unlock func()) {
 // writeStatusFile writes s to path atomically (temp file + rename in the same
 // directory) so a reader never sees a torn file.
 func writeStatusFile(path string, s Status) error {
+	return writeStatus(path, s, nil)
+}
+
+// marshalStatus renders s as indented JSON followed by the extra fields (ones
+// this version's Status does not define), in key order.
+func marshalStatus(s Status, extra map[string]json.RawMessage) ([]byte, error) {
 	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil || len(extra) == 0 {
+		return data, err
+	}
+	keys := make([]string, 0, len(extra))
+	for k := range extra {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	body := bytes.TrimRight(bytes.TrimSuffix(data, []byte("}")), "\n")
+	sep := ","
+	if bytes.Equal(bytes.TrimSpace(body), []byte("{")) {
+		sep = ""
+	}
+	var b bytes.Buffer
+	b.Write(body)
+	for _, k := range keys {
+		var v bytes.Buffer
+		if json.Indent(&v, extra[k], "  ", "  ") != nil {
+			continue
+		}
+		name, _ := json.Marshal(k)
+		b.WriteString(sep + "\n  ")
+		b.Write(name)
+		b.WriteString(": ")
+		b.Write(v.Bytes())
+		sep = ","
+	}
+	b.WriteString("\n}")
+	return b.Bytes(), nil
+}
+
+// writeStatus writes s, plus extra fields, to path atomically.
+func writeStatus(path string, s Status, extra map[string]json.RawMessage) error {
+	data, err := marshalStatus(s, extra)
 	if err != nil {
 		return err
 	}
@@ -261,12 +365,15 @@ type checkOutcome struct {
 	// updaterReplaced reports that the pilot-updater binary itself was
 	// swapped, so the running updater process is now stale.
 	updaterReplaced bool
-	// restartErr is the error from restarting the daemon onto the new
-	// binaries, if that failed.
-	restartErr error
+	// restart is the daemon restart this check made (nil = none: nothing
+	// was installed, or the loop left it to its successor process).
+	restart *restartOutcome
+	// updaterRestart is the updater service restart this check made (nil =
+	// none).
+	updaterRestart *restartOutcome
 	// daemonCurrent reports that, with nothing installed by this check, the
-	// daemon was found running the installed binary (Linux only), so an
-	// earlier restart_error no longer applies.
+	// daemon was found running the installed release, so an earlier
+	// restart_error no longer applies.
 	daemonCurrent bool
 }
 
@@ -305,25 +412,58 @@ func (u *Updater) recordCheck(trigger string, out checkOutcome, checkErr error) 
 		s.LastResult = ResultUpdated
 		s.LastUpdateAt = now
 		s.LastUpdateVersion = out.installed
-		if out.restartErr != nil {
-			s.RestartError = out.restartErr.Error()
-		} else if !out.updaterReplaced {
-			// The daemon was restarted onto the new binaries. (When the
-			// updater replaced itself, the restart happens in the new
-			// process — see recoverPendingRestart — which records it.)
-			s.RestartError = ""
+		// When the loop replaced its own binary it exits without restarting
+		// the daemon: the new process does that (recoverPendingRestart) and
+		// records it.
+		if out.restart != nil {
+			applyDaemonRestart(s, *out.restart, now)
+		}
+		if out.updaterRestart != nil {
+			applyUpdaterRestart(s, *out.updaterRestart, now)
 		}
 	})
 }
 
+// applyDaemonRestart records a daemon restart attempt in s.
+func applyDaemonRestart(s *Status, r restartOutcome, now time.Time) {
+	if r.err != nil {
+		s.RestartError = r.err.Error()
+		return
+	}
+	s.RestartError = ""
+	if r.restarted {
+		s.DaemonRestartedAt = now
+		s.DaemonRestartedBy = r.by
+		s.DaemonRestartedVersion = r.version
+	}
+}
+
+// applyUpdaterRestart records an updater service restart attempt in s.
+func applyUpdaterRestart(s *Status, r restartOutcome, now time.Time) {
+	if r.err != nil {
+		s.UpdaterRestartError = r.err.Error()
+		return
+	}
+	s.UpdaterRestartError = ""
+	if r.restarted {
+		s.UpdaterRestartedAt = now
+	}
+}
+
 // recordRestart records the outcome of a daemon restart made outside a
 // check (recoverPendingRestart).
-func (u *Updater) recordRestart(err error) {
-	u.updateStatus(func(s *Status) {
-		if err != nil {
-			s.RestartError = err.Error()
-		} else {
-			s.RestartError = ""
+func (u *Updater) recordRestart(r restartOutcome) {
+	now := time.Now().UTC()
+	u.updateStatus(func(s *Status) { applyDaemonRestart(s, r, now) })
+}
+
+// recordedRestartError is the restart_error currently on record: in the
+// status file when there is one, else in this Updater's last status.
+func (u *Updater) recordedRestartError() string {
+	if path := u.statusPath(); path != "" {
+		if s, err := ReadStatus(path); err == nil {
+			return s.RestartError
 		}
-	})
+	}
+	return u.LastStatus().RestartError
 }

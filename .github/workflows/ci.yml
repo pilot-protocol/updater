@@ -51,3 +51,20 @@ jobs:
           name: coverage-updater
           path: updater/coverage.out
           retention-days: 30
+
+  # The macOS restart path (launchctl, the daemon's IPC socket) runs natively
+  # here. launchctl and the daemon are fakes: TestMain stubs both, and the
+  # exec-level test puts a script launchctl alone on PATH.
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run tests
+        run: go test -race ./...

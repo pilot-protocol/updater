@@ -21,12 +21,15 @@ import (
 	"time"
 )
 
-// restartSpy captures daemon-restart attempts on both platforms: launchctl
-// on macOS (runCmd) and SIGTERM on Linux (killFn). On Linux the daemon is a
-// fake /proc entry whose exe reads "<path> (deleted)", which is what a real
-// daemon looks like right after its binary was renamed over. It runs in
-// pilot-daemon.service with Restart=always, and after a successful SIGTERM
-// the fake systemd starts it again on the installed binary.
+// restartSpy captures daemon-restart attempts on both platforms: `launchctl
+// kickstart -k` on macOS and SIGTERM on Linux (killFn). On macOS the daemon
+// runs under its launchd job from the installed binary; after a kickstart
+// the fake launchd starts it again and it answers over IPC with the
+// installed version. On Linux the daemon is a fake /proc entry whose exe
+// reads "<path> (deleted)", which is what a real daemon looks like right
+// after its binary was renamed over. It runs in pilot-daemon.service with
+// Restart=always, and after a successful SIGTERM the fake systemd starts it
+// again on the installed binary.
 type restartSpy struct {
 	mu    sync.Mutex
 	calls []string
@@ -35,15 +38,19 @@ type restartSpy struct {
 
 func (r *restartSpy) install(t *testing.T, u *Updater) {
 	t.Helper()
-	u.runCmd = func(name string, args ...string) ([]byte, error) {
+	fl := newFakeLaunchd(t)
+	fl.installDir = u.config.InstallDir
+	fl.addDaemonJob(daemonTarget, filepath.Join(u.config.InstallDir, "pilot-daemon"), 700, fakeSocket, "v0.0.1")
+	fl.onKickstart = func(target string) ([]byte, error) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		r.calls = append(r.calls, name+" "+strings.Join(args, " "))
+		r.calls = append(r.calls, "launchctl kickstart -k "+target)
 		if r.fail != nil {
 			return []byte("launchd says no"), r.fail
 		}
 		return nil, nil
 	}
+	fl.wire(u)
 	sys := newFakeSystem(t, u.config.InstallDir)
 	sys.addReplacedDaemon(3999999, cgroupPilotService)
 	sys.writeFile("pilot-daemon.service", daemonUnit(sys.daemon, "always"))

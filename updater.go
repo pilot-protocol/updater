@@ -101,8 +101,12 @@ type Updater struct {
 	procRoot    string        // "" = /proc
 	goos        string        // "" = runtime.GOOS; selects the restart mechanism
 	systemdDirs []string      // nil = systemdSystemUnitDirs
-	restartWait time.Duration // 0 = defaultRestartWait
+	restartWait time.Duration // 0 = defaultRestartWait (Linux), defaultLaunchdRestartWait (macOS)
 	restartPoll time.Duration // 0 = defaultRestartPoll
+	getuid      func() int    // nil = os.Getuid; selects the launchd domains
+	// probeFn asks the daemon on a socket for its version (IPC info); nil =
+	// probeDaemonVersion.
+	probeFn func(socket string) (version string, running bool)
 
 	statusMu       sync.Mutex
 	status         Status
@@ -110,8 +114,9 @@ type Updater struct {
 }
 
 // runCommand runs an external command and returns its combined output. The
-// only command the updater ever runs is launchctl (daemon restart on macOS);
-// it never runs gh or any other tool. Tests replace this so the suite cannot
+// only command the updater ever runs is launchctl (`print` and `kickstart`,
+// to restart the daemon and the updater service under launchd on macOS); it
+// never runs gh or any other tool. Tests replace this so the suite cannot
 // restart a real daemon on a developer machine.
 var runCommand = func(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).CombinedOutput()
@@ -167,9 +172,10 @@ func (u *Updater) Stop() {
 // to the status file when one is configured.
 //
 // RunOnce never exits the calling process. When the release replaces the
-// pilot-updater binary, the daemon is still restarted onto the new binaries;
-// a separately running updater service picks up its new binary the next
-// time its service manager restarts it.
+// pilot-updater binary, the daemon is still restarted onto the new binaries.
+// On macOS the updater service (its launchd job) is then restarted onto the
+// new pilot-updater too; elsewhere a separately running updater service picks
+// up its new binary the next time its service manager restarts it.
 func (u *Updater) RunOnce() error {
 	u.recoverPendingRestart()
 	return u.runCheck(TriggerManual)
@@ -269,7 +275,7 @@ func (u *Updater) checkOnce() error {
 // error.
 func (u *Updater) runCheck(trigger string) error {
 	out, err := u.check()
-	if out.installed == "" {
+	if out.installed == "" && u.recordedRestartError() != "" {
 		// A daemon now running the installed binary (restarted by hand after
 		// an earlier restart failure) settles restart_error.
 		out.daemonCurrent = u.daemonOnInstalledBinary()
@@ -288,8 +294,9 @@ func (u *Updater) runCheck(trigger string) error {
 	if out.updaterReplaced && trigger == TriggerAuto {
 		// This process is now running a stale updater. Record the update,
 		// then exit so launchd/systemd restarts the process with the new
-		// binary. On startup the new process runs recoverPendingRestart(),
-		// which restarts the daemon (and records the result).
+		// binary (install.sh runs it with KeepAlive true / Restart=always).
+		// On startup the new process runs recoverPendingRestart(), which
+		// restarts the daemon (and records the result).
 		u.recordCheck(trigger, out, nil)
 		slog.Info("updater binary replaced — exiting for process manager to restart with new binary")
 		exit := u.exitFn
@@ -299,13 +306,20 @@ func (u *Updater) runCheck(trigger string) error {
 		exit(0)
 		return nil
 	}
-	if out.updaterReplaced {
-		slog.Info("pilot-updater binary replaced; a running updater service uses it after its next restart")
-	}
 
 	// Restart the daemon onto the new binaries (SIGTERM / launchctl).
-	out.restartErr = u.signalDaemonRestart()
+	restart := u.signalDaemonRestart()
+	out.restart = &restart
 	u.touchRestartRecord()
+
+	// A one-shot run that replaced pilot-updater also moves the updater
+	// service onto it. This comes after the restart record is written, so
+	// the restarted updater does not restart the daemon a second time.
+	if out.updaterReplaced {
+		if r, attempted := u.restartUpdaterService(); attempted {
+			out.updaterRestart = &r
+		}
+	}
 	u.recordCheck(trigger, out, nil)
 	return nil
 }
@@ -765,9 +779,9 @@ func (u *Updater) recoverPendingRestart() {
 	recordStat, err := os.Stat(restartRecord)
 	if err != nil || binStat.ModTime().After(recordStat.ModTime()) {
 		slog.Info("daemon binary updated since last restart, triggering restart")
-		err := u.signalDaemonRestart()
+		restart := u.signalDaemonRestart()
 		u.touchRestartRecord()
-		u.recordRestart(err)
+		u.recordRestart(restart)
 	}
 }
 
@@ -796,11 +810,29 @@ func writeFileSync(path string, data []byte, perm os.FileMode) error {
 	return f.Close()
 }
 
+// restartOutcome is what one attempt to move a running service onto newly
+// installed binaries did.
+type restartOutcome struct {
+	// restarted reports that the service was stopped and came back on the
+	// new binary.
+	restarted bool
+	// by names the service manager and job that restarted it, e.g.
+	// "launchd gui/501/network.pilotprotocol.pilot-daemon".
+	by string
+	// version is the version the daemon reported over IPC after the restart
+	// ("" = not asked).
+	version string
+	// err is set when the service may still run the old binary. It says how
+	// to restart it. A service that is not running at all is not an error:
+	// its next start uses the new binary.
+	err error
+}
+
 // signalDaemonRestart restarts the daemon so it runs the newly installed
-// binaries. It returns an error when the daemon may still be running the old
-// binary; a daemon that is not running at all is not an error (its next
-// start uses the new binary).
-func (u *Updater) signalDaemonRestart() error {
+// binaries. The outcome's err is set when the daemon may still be running
+// the old binary; a daemon that is not running at all is not an error (its
+// next start uses the new binary).
+func (u *Updater) signalDaemonRestart() restartOutcome {
 	if u.targetOS() == "darwin" {
 		return u.signalDaemonRestartDarwin()
 	}
@@ -815,25 +847,7 @@ func (u *Updater) command(name string, args ...string) ([]byte, error) {
 	return runCommand(name, args...)
 }
 
-func (u *Updater) signalDaemonRestartDarwin() error {
-	// On macOS the daemon is managed by launchd. Use launchctl kickstart -k
-	// to kill the running instance and restart it immediately. The label
-	// matches the plist written by install.sh.
-	uid := os.Getuid()
-	label := "network.pilotprotocol.pilot-daemon"
-	target := fmt.Sprintf("gui/%d/%s", uid, label)
-	out, err := u.command("launchctl", "kickstart", "-k", target)
-	if err != nil {
-		output := strings.TrimSpace(string(out))
-		slog.Warn("launchctl kickstart failed — restart daemon manually",
-			"target", target, "err", err, "output", output)
-		return fmt.Errorf("restart daemon (launchctl kickstart -k %s): %v %s", target, err, output)
-	}
-	slog.Info("daemon restarted via launchctl", "target", target)
-	return nil
-}
-
-func (u *Updater) signalDaemonRestartLinux() error {
+func (u *Updater) signalDaemonRestartLinux() restartOutcome {
 	// On Linux, find the daemon process via /proc/<pid>/exe. When systemd
 	// will start it again (see supervisor.go), send SIGTERM and wait for the
 	// new process; otherwise leave it running and say how to restart it.
@@ -842,17 +856,17 @@ func (u *Updater) signalDaemonRestartLinux() error {
 	pid, err := findProcessByExe(procRoot, daemonPath)
 	if err != nil {
 		slog.Warn("cannot read /proc — restart daemon manually", "error", err)
-		return fmt.Errorf("restart daemon: find process: %w", err)
+		return restartOutcome{err: fmt.Errorf("restart daemon: find process: %w", err)}
 	}
 	if pid == 0 {
 		// Not running: its next start uses the new binary.
 		slog.Warn("daemon process not found — restart daemon manually if it is running", "path", daemonPath)
-		return nil
+		return restartOutcome{}
 	}
 	unit, err := u.daemonSupervisor(procRoot, pid, daemonPath)
 	if err != nil {
 		slog.Warn("daemon not restarted onto the new binary", "pid", pid, "reason", err)
-		return fmt.Errorf("restart daemon: %w", err)
+		return restartOutcome{err: fmt.Errorf("restart daemon: %w", err)}
 	}
 	slog.Info("sending SIGTERM to daemon; systemd starts it again", "pid", pid, "unit", unit)
 	kill := u.killFn
@@ -860,15 +874,15 @@ func (u *Updater) signalDaemonRestartLinux() error {
 		kill = syscall.Kill
 	}
 	if err := kill(pid, syscall.SIGTERM); err != nil {
-		return fmt.Errorf("restart daemon: signal pid %d: %w", pid, err)
+		return restartOutcome{err: fmt.Errorf("restart daemon: signal pid %d: %w", pid, err)}
 	}
 	newPid, err := u.waitForDaemonRestart(procRoot, daemonPath, pid, unit)
 	if err != nil {
 		slog.Error("daemon did not come back after SIGTERM", "unit", unit, "error", err)
-		return fmt.Errorf("restart daemon: %w", err)
+		return restartOutcome{err: fmt.Errorf("restart daemon: %w", err)}
 	}
 	slog.Info("daemon restarted on the new binary", "unit", unit, "pid", newPid)
-	return nil
+	return restartOutcome{restarted: true, by: "systemd " + unit}
 }
 
 // findProcessByExe returns the pid of a process (other than this one) whose
